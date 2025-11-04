@@ -10,3 +10,5 @@ python-dotenv==1.0.0
 scipy==1.11.4
 hsic==0.0.4
 pyHSICLasso==0.0.6
+fairlearn==0.10.0
+aif360==0.5.0

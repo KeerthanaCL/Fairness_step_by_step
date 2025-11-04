@@ -50,3 +50,24 @@ class StatusResponse(BaseModel):
 class FeatureRelationshipResponse(BaseModel):
     primary_feature: str
     related_features: List[Dict[str, Any]]
+
+class BiasAnalysisRequest(BaseModel):
+    sensitive_feature_column: str = Field(..., description="Column name of sensitive attribute")
+    prediction_column: Optional[str] = None
+    prediction_proba_column: Optional[str] = None
+
+class BiasMetricResult(BaseModel):
+    metric: str
+    is_biased: bool
+    threshold: float
+    description: str
+
+class BiasAnalysisResponse(BaseModel):
+    status: str
+    analysis_type: str
+    sensitive_feature: str
+    total_metrics: int
+    biased_metrics_count: int
+    overall_bias_status: str
+    metrics_results: Dict[str, Any]
+    recommendations: List[str]
