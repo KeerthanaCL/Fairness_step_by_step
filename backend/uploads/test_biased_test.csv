@@ -1,0 +1,7 @@
+age,education_num,hours_per_week,sex_Male,race_Other,race_White,income
+46,9,40,True,False,False,0
+30,9,40,False,False,False,1
+50,13,55,False,False,False,0
+36,13,36,True,False,True,1
+63,9,40,True,False,True,1
+29,9,50,True,False,True,0
