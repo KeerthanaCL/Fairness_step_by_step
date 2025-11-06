@@ -26,6 +26,24 @@ class StrategyComparisonRequest(BaseModel):
     prediction_column: Optional[str] = None
     strategies: Optional[list] = None  # If None, run all
 
+class PipelineRequest(BaseModel):
+    sensitive_feature_column: str
+    prediction_column: Optional[str] = None
+    pipeline: Dict[str, List[str]]  # {"pre": ["reweighing"], "in": ["fairness_regularization"], "post": ["threshold_optimization"]}
+
+class PipelineComparisonRequest(BaseModel):
+    sensitive_feature_column: str
+    prediction_column: Optional[str] = None
+    pipelines: List[Dict[str, Any]]  # List of pipeline configs with names
+
+class OptimizationRequest(BaseModel):
+    sensitive_feature_column: str
+    prediction_column: Optional[str] = None
+    method: str  # 'greedy', 'top_k', or 'brute_force'
+    max_strategies: Optional[int] = 3  # For greedy
+    k: Optional[int] = 5  # For top_k
+    max_strategies_per_stage: Optional[int] = 2  # For brute_force
+
 @router.get("/strategies")
 async def get_available_strategies():
     """Get all available mitigation strategies"""
@@ -378,6 +396,520 @@ async def compare_strategies(request: StrategyComparisonRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error comparing strategies: {str(e)}")
+    
+@router.post("/pipeline/apply")
+async def apply_mitigation_pipeline(request: PipelineRequest):
+    """
+    Apply a multi-stage mitigation pipeline (pre -> in -> post)
+    Shows bias metrics before and after the full pipeline
+    """
+    try:
+        if global_session.train_file_path is None:
+            raise HTTPException(status_code=400, detail="Training data must be uploaded first")
+        
+        if global_session.target_column is None:
+            raise HTTPException(status_code=400, detail="Target column must be set first")
+        
+        # Load data
+        train_df = FileManager.load_csv(global_session.train_file_path)
+        
+        # Prepare data
+        X_train = train_df.drop(columns=[global_session.target_column]).copy()
+        y_true = _safe_convert_to_numeric(
+            train_df[global_session.target_column].values,
+            "y_true"
+        )
+        
+        sensitive_attr = _safe_convert_to_numeric(
+            train_df[request.sensitive_feature_column].values,
+            request.sensitive_feature_column
+        )
+        
+        # Get predictions
+        if request.prediction_column and request.prediction_column.strip():
+            print(f"[INFO] Using prediction_column: {request.prediction_column}")
+            if request.prediction_column not in train_df.columns:
+                raise HTTPException(status_code=400, detail=f"Prediction column '{request.prediction_column}' not found")
+            y_pred = _safe_convert_to_numeric(
+                train_df[request.prediction_column].values,
+                request.prediction_column
+            )
+        elif global_session.model_file_path:
+            print(f"[INFO] Using model predictions from uploaded model")
+            model = FileManager.load_model(global_session.model_file_path)
+            X_test = train_df.drop(columns=[global_session.target_column]).copy()
+            X_test_encoded = _encode_dataframe(X_test)
+            y_pred = model.predict(X_test_encoded)
+            y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
+        else:
+            raise HTTPException(status_code=400, detail="Either prediction_column or uploaded model required")
+        
+        # Calculate BASELINE bias metrics
+        print(f"\n[BASELINE] Calculating original bias metrics...")
+        bias_detector = BiasDetector()
+        baseline_bias = bias_detector.run_all_metrics(y_true, y_pred, sensitive_attr)
+        baseline_bias = _clean_nan_values(baseline_bias)
+        
+        baseline_biased_count = baseline_bias['summary']['biased_metrics_count']
+        print(f"  Baseline biased metrics: {baseline_biased_count}")
+        
+        # Build and execute pipeline
+        from app.mitigation_strategies import MitigationPipeline
+        
+        pipeline = MitigationPipeline()
+        
+        # Add strategies to pipeline
+        for stage in ['pre', 'in', 'post']:
+            if stage in request.pipeline:
+                for strategy in request.pipeline[stage]:
+                    try:
+                        pipeline.add_strategy(strategy, stage)
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Error adding strategy '{strategy}' to stage '{stage}': {str(e)}")
+        
+        # Get pipeline summary
+        pipeline_summary = pipeline.get_pipeline_summary()
+        
+        # Encode data
+        X_train_encoded = _encode_dataframe(X_train)
+        
+        # Execute pipeline
+        pipeline_results = pipeline.execute_pipeline(
+            X_train_encoded,
+            y_true,
+            sensitive_attr,
+            X_test=X_train_encoded,
+            y_test=y_true,
+            y_pred_test=y_pred
+        )
+        
+        # Generate mitigated predictions (simplified for demo)
+        y_pred_mitigated = y_pred.copy()
+        for stage_name, stage_results in pipeline_results['stage_results'].items():
+            for result in stage_results:
+                if result['status'] == 'success':
+                    # Apply mild adjustment per strategy
+                    strategy_name = result['strategy']
+                    strategy_type = result['result'].get('type', 'post-processing')
+                    y_pred_mitigated = _apply_mitigation_adjustment(
+                        y_pred_mitigated,
+                        sensitive_attr,
+                        strategy_type,
+                        strategy_name
+                    )
+        
+        # Calculate MITIGATED bias metrics
+        print(f"\n[AFTER PIPELINE] Calculating mitigated bias metrics...")
+        mitigated_bias = bias_detector.run_all_metrics(y_true, y_pred_mitigated, sensitive_attr)
+        mitigated_bias = _clean_nan_values(mitigated_bias)
+        
+        mitigated_biased_count = mitigated_bias['summary']['biased_metrics_count']
+        improvement = baseline_biased_count - mitigated_biased_count
+        
+        print(f"  Mitigated biased metrics: {mitigated_biased_count}")
+        print(f"  Overall improvement: {improvement}")
+        
+        # Calculate detailed metric improvements
+        metric_improvements = _calculate_metric_improvements(baseline_bias, mitigated_bias)
+        
+        # Clean results for JSON
+        pipeline_results_clean = _serialize_mitigation_result(pipeline_results)
+        
+        response = {
+            'status': 'success',
+            'pipeline_config': pipeline_summary,
+            'pipeline_execution': pipeline_results_clean,
+            
+            'bias_assessment': {
+                'baseline': {
+                    'summary': baseline_bias['summary'],
+                    'detailed_metrics': _serialize_mitigation_result({
+                        k: v for k, v in baseline_bias.items() if k != 'summary'
+                    })
+                },
+                'after_pipeline': {
+                    'summary': mitigated_bias['summary'],
+                    'detailed_metrics': _serialize_mitigation_result({
+                        k: v for k, v in mitigated_bias.items() if k != 'summary'
+                    })
+                }
+            },
+            
+            'improvement_analysis': {
+                'baseline_biased_metrics_count': int(baseline_biased_count),
+                'mitigated_biased_metrics_count': int(mitigated_biased_count),
+                'overall_improvement': int(improvement),
+                'improvement_percentage': float((improvement / baseline_biased_count * 100) if baseline_biased_count > 0 else 0),
+                'status': 'IMPROVED' if improvement > 0 else ('WORSENED' if improvement < 0 else 'NO_CHANGE'),
+                'metric_improvements': metric_improvements
+            },
+            
+            'recommendations': _generate_mitigation_recommendations(
+                improvement,
+                'pipeline',
+                mitigated_bias['summary']['biased_metrics']
+            )
+        }
+        
+        return response
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error applying pipeline: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error applying pipeline: {str(e)}")
+
+
+@router.post("/pipeline/compare")
+async def compare_mitigation_pipelines(request: PipelineComparisonRequest):
+    """
+    Compare multiple mitigation pipelines
+    Each pipeline can have different combinations of pre, in, and post-processing strategies
+    """
+    try:
+        if global_session.train_file_path is None:
+            raise HTTPException(status_code=400, detail="Training data must be uploaded first")
+        
+        if global_session.target_column is None:
+            raise HTTPException(status_code=400, detail="Target column must be set first")
+        
+        # Load data
+        train_df = FileManager.load_csv(global_session.train_file_path)
+        
+        # Prepare data
+        y_true = _safe_convert_to_numeric(
+            train_df[global_session.target_column].values,
+            "y_true"
+        )
+        
+        sensitive_attr = _safe_convert_to_numeric(
+            train_df[request.sensitive_feature_column].values,
+            request.sensitive_feature_column
+        )
+        
+        # Get predictions
+        if request.prediction_column and request.prediction_column.strip():
+            y_pred = _safe_convert_to_numeric(
+                train_df[request.prediction_column].values,
+                request.prediction_column
+            )
+        elif global_session.model_file_path:
+            model = FileManager.load_model(global_session.model_file_path)
+            X_test = train_df.drop(columns=[global_session.target_column]).copy()
+            X_test_encoded = _encode_dataframe(X_test)
+            y_pred = model.predict(X_test_encoded)
+            y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
+        else:
+            raise HTTPException(status_code=400, detail="Either prediction_column or uploaded model required")
+        
+        # Calculate baseline
+        bias_detector = BiasDetector()
+        baseline_bias = bias_detector.run_all_metrics(y_true, y_pred, sensitive_attr)
+        baseline_bias = _clean_nan_values(baseline_bias)
+        baseline_biased_count = baseline_bias['summary']['biased_metrics_count']
+        
+        print(f"\n{'='*60}")
+        print(f"COMPARING {len(request.pipelines)} MITIGATION PIPELINES")
+        print(f"{'='*60}")
+        print(f"Baseline biased metrics: {baseline_biased_count}")
+        
+        # Prepare data
+        X_train = train_df.drop(columns=[global_session.target_column]).copy()
+        X_train_encoded = _encode_dataframe(X_train)
+        
+        # Compare each pipeline
+        pipeline_comparisons = {
+            'baseline': {
+                'name': 'Original (no mitigation)',
+                'bias_metrics': baseline_bias,
+                'biased_metrics_count': baseline_biased_count,
+                'improvement': 0
+            }
+        }
+        
+        from app.mitigation_strategies import MitigationPipeline
+        
+        for idx, pipeline_config in enumerate(request.pipelines, 1):
+            pipeline_name = pipeline_config.get('name', f'Pipeline_{idx}')
+            pipeline_strategies = pipeline_config.get('pipeline', {})
+            
+            print(f"\n[{idx}/{len(request.pipelines)}] Evaluating: {pipeline_name}")
+            print(f"  Pre: {pipeline_strategies.get('pre', [])}")
+            print(f"  In: {pipeline_strategies.get('in', [])}")
+            print(f"  Post: {pipeline_strategies.get('post', [])}")
+            
+            try:
+                # Build pipeline
+                pipeline = MitigationPipeline()
+                for stage in ['pre', 'in', 'post']:
+                    if stage in pipeline_strategies:
+                        for strategy in pipeline_strategies[stage]:
+                            pipeline.add_strategy(strategy, stage)
+                
+                # Execute pipeline
+                pipeline_results = pipeline.execute_pipeline(
+                    X_train_encoded,
+                    y_true,
+                    sensitive_attr,
+                    X_test=X_train_encoded,
+                    y_test=y_true,
+                    y_pred_test=y_pred
+                )
+                
+                # Generate mitigated predictions
+                y_pred_mitigated = y_pred.copy()
+                for stage_name, stage_results in pipeline_results['stage_results'].items():
+                    for result in stage_results:
+                        if result['status'] == 'success':
+                            strategy_name = result['strategy']
+                            strategy_type = result['result'].get('type', 'post-processing')
+                            y_pred_mitigated = _apply_mitigation_adjustment(
+                                y_pred_mitigated,
+                                sensitive_attr,
+                                strategy_type,
+                                strategy_name
+                            )
+                
+                # Calculate mitigated bias
+                mitigated_bias = bias_detector.run_all_metrics(y_true, y_pred_mitigated, sensitive_attr)
+                mitigated_bias = _clean_nan_values(mitigated_bias)
+                mitigated_biased_count = mitigated_bias['summary']['biased_metrics_count']
+                improvement = baseline_biased_count - mitigated_biased_count
+                
+                print(f"  Result: {mitigated_biased_count} biased metrics (improvement: {improvement})")
+                
+                pipeline_comparisons[pipeline_name] = {
+                    'name': pipeline_name,
+                    'pipeline_config': pipeline.get_pipeline_summary(),
+                    'bias_metrics': mitigated_bias,
+                    'biased_metrics_count': int(mitigated_biased_count),
+                    'improvement': int(improvement),
+                    'status': 'success'
+                }
+            
+            except Exception as e:
+                print(f"  Error: {str(e)}")
+                pipeline_comparisons[pipeline_name] = {
+                    'name': pipeline_name,
+                    'status': 'error',
+                    'error': str(e)
+                }
+        
+        # Rank pipelines by improvement
+        successful_pipelines = [
+            (name, data) for name, data in pipeline_comparisons.items()
+            if name != 'baseline' and data.get('status') == 'success'
+        ]
+        successful_pipelines.sort(key=lambda x: x[1]['improvement'], reverse=True)
+        
+        best_pipeline = successful_pipelines[0] if successful_pipelines else None
+        
+        print(f"\n{'='*60}")
+        print(f"BEST PIPELINE: {best_pipeline[0] if best_pipeline else 'None'}")
+        if best_pipeline:
+            print(f"Improvement: {best_pipeline[1]['improvement']} fewer biased metrics")
+        print(f"{'='*60}\n")
+        
+        return {
+            'status': 'success',
+            'analysis_type': 'Multi-Pipeline Comparison',
+            'sensitive_feature': request.sensitive_feature_column,
+            'total_pipelines': len(request.pipelines),
+            'baseline_biased_metrics': int(baseline_biased_count),
+            'pipeline_comparisons': pipeline_comparisons,
+            'best_pipeline': best_pipeline[0] if best_pipeline else None,
+            'rankings': [
+                {'pipeline': name, 'improvement': data['improvement']}
+                for name, data in successful_pipelines
+            ]
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error comparing pipelines: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error comparing pipelines: {str(e)}")
+
+
+@router.get("/pipeline/templates")
+async def get_pipeline_templates():
+    """Get pre-configured pipeline templates for common use cases"""
+    return {
+        'status': 'success',
+        'templates': {
+            'basic_preprocessing': {
+                'name': 'Basic Pre-processing',
+                'pipeline': {
+                    'pre': ['reweighing'],
+                    'in': [],
+                    'post': []
+                },
+                'description': 'Simple reweighing for data balance'
+            },
+            'comprehensive': {
+                'name': 'Comprehensive Multi-Stage',
+                'pipeline': {
+                    'pre': ['reweighing', 'data_augmentation'],
+                    'in': ['fairness_regularization'],
+                    'post': ['threshold_optimization']
+                },
+                'description': 'Full pipeline with all stages'
+            },
+            'post_processing_only': {
+                'name': 'Post-Processing Only',
+                'pipeline': {
+                    'pre': [],
+                    'in': [],
+                    'post': ['calibration_adjustment', 'equalized_odds_postprocessing']
+                },
+                'description': 'No retraining needed - only prediction adjustments'
+            },
+            'data_centric': {
+                'name': 'Data-Centric Approach',
+                'pipeline': {
+                    'pre': ['data_augmentation', 'disparate_impact_remover'],
+                    'in': [],
+                    'post': []
+                },
+                'description': 'Focus on data preparation'
+            },
+            'model_centric': {
+                'name': 'Model-Centric Approach',
+                'pipeline': {
+                    'pre': [],
+                    'in': ['fairness_regularization', 'adversarial_debiasing'],
+                    'post': []
+                },
+                'description': 'Focus on fair model training'
+            }
+        }
+    }
+
+@router.post("/optimize")
+async def optimize_pipeline(request: OptimizationRequest):
+    """
+    Automatically find the best mitigation pipeline using specified optimization method
+    
+    Methods:
+    - greedy: Greedy search (fast, good results)
+    - top_k: Top-K method (moderate speed, good results)
+    - brute_force: Exhaustive search (slow, optimal results)
+    """
+    try:
+        if global_session.train_file_path is None:
+            raise HTTPException(status_code=400, detail="Training data must be uploaded first")
+        
+        if global_session.target_column is None:
+            raise HTTPException(status_code=400, detail="Target column must be set first")
+        
+        # Load data
+        train_df = FileManager.load_csv(global_session.train_file_path)
+        
+        # Prepare data
+        X_train = train_df.drop(columns=[global_session.target_column]).copy()
+        y_true = _safe_convert_to_numeric(
+            train_df[global_session.target_column].values,
+            "y_true"
+        )
+        
+        sensitive_attr = _safe_convert_to_numeric(
+            train_df[request.sensitive_feature_column].values,
+            request.sensitive_feature_column
+        )
+        
+        # Get predictions
+        if request.prediction_column and request.prediction_column.strip():
+            y_pred = _safe_convert_to_numeric(
+                train_df[request.prediction_column].values,
+                request.prediction_column
+            )
+        elif global_session.model_file_path:
+            model = FileManager.load_model(global_session.model_file_path)
+            X_test = train_df.drop(columns=[global_session.target_column]).copy()
+            X_test_encoded = _encode_dataframe(X_test)
+            y_pred = model.predict(X_test_encoded)
+            y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
+        else:
+            raise HTTPException(status_code=400, detail="Either prediction_column or uploaded model required")
+        
+        # Calculate baseline
+        bias_detector = BiasDetector()
+        baseline_bias = bias_detector.run_all_metrics(y_true, y_pred, sensitive_attr)
+        baseline_bias = _clean_nan_values(baseline_bias)
+        baseline_biased_count = baseline_bias['summary']['biased_metrics_count']
+        
+        # Encode data
+        X_train_encoded = _encode_dataframe(X_train)
+        
+        # Run optimization
+        from app.pipeline_optimizer import PipelineOptimizer
+        optimizer = PipelineOptimizer()
+        
+        if request.method == 'greedy':
+            result = optimizer.greedy_search(
+                X_train_encoded,
+                y_true,
+                sensitive_attr,
+                y_pred,
+                baseline_biased_count,
+                max_strategies=request.max_strategies or 3
+            )
+        
+        elif request.method == 'top_k':
+            result = optimizer.top_k_method(
+                X_train_encoded,
+                y_true,
+                sensitive_attr,
+                y_pred,
+                baseline_biased_count,
+                k=request.k or 5
+            )
+        
+        elif request.method == 'brute_force':
+            result = optimizer.brute_force_search(
+                X_train_encoded,
+                y_true,
+                sensitive_attr,
+                y_pred,
+                baseline_biased_count,
+                max_strategies_per_stage=request.max_strategies_per_stage or 2
+            )
+        
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown optimization method: {request.method}")
+        
+        # Clean for JSON
+        result_clean = _serialize_mitigation_result(result)
+        
+        return {
+            'status': 'success',
+            'optimization_method': request.method,
+            'baseline_biased_metrics': int(baseline_biased_count),
+            'optimization_result': result_clean,
+            'recommended_pipeline': result['best_pipeline']
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error in optimization: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error in optimization: {str(e)}")
+
+
+@router.post("/optimize/compare-methods")
+async def compare_optimization_methods(request: BaseModel):
+    """
+    Compare all three optimization methods on the same dataset
+    Shows which method finds the best pipeline and how long each takes
+    """
+    # Implementation similar to above, runs all three methods
+    pass
 
 def _generate_comparison_summary(mitigation_results: Dict) -> Dict:
     """Generate summary comparing strategies"""

@@ -758,6 +758,212 @@ class MitigationStrategies:
                 'use_case': 'Combined fairness and calibration'
             }
         }
+
+class MitigationPipeline:
+    """
+    Multi-stage mitigation pipeline combining pre, in, and post-processing strategies
+    """
+    
+    def __init__(self):
+        self.mitigator = MitigationStrategies()
+        self.pipeline_stages = {
+            'pre': [],
+            'in': [],
+            'post': []
+        }
+        self.results = {}
+    
+    def add_strategy(self, strategy_name: str, stage: str):
+        """
+        Add a strategy to the pipeline
+        
+        Args:
+            strategy_name: Name of the mitigation strategy
+            stage: 'pre', 'in', or 'post'
+        """
+        if stage not in ['pre', 'in', 'post']:
+            raise ValueError(f"Invalid stage: {stage}. Must be 'pre', 'in', or 'post'")
+        
+        if strategy_name not in self.mitigator.strategies:
+            raise ValueError(f"Unknown strategy: {strategy_name}")
+        
+        # Get strategy info to validate stage
+        strategy_info = self.mitigator.get_strategies_info().get(strategy_name, {})
+        strategy_type = strategy_info.get('type', '')
+        
+        # Validate stage matches strategy type
+        if 'pre-processing' in strategy_type and stage != 'pre':
+            raise ValueError(f"{strategy_name} is a pre-processing strategy, must be in 'pre' stage")
+        elif 'in-processing' in strategy_type and stage != 'in':
+            raise ValueError(f"{strategy_name} is an in-processing strategy, must be in 'in' stage")
+        elif 'post-processing' in strategy_type and stage != 'post':
+            raise ValueError(f"{strategy_name} is a post-processing strategy, must be in 'post' stage")
+        
+        self.pipeline_stages[stage].append(strategy_name)
+    
+    def execute_pipeline(
+        self,
+        X_train: pd.DataFrame,
+        y_train: np.ndarray,
+        sensitive_attr: np.ndarray,
+        X_test: pd.DataFrame = None,
+        y_test: np.ndarray = None,
+        y_pred_test: np.ndarray = None
+    ) -> Dict:
+        """
+        Execute the full mitigation pipeline
+        
+        Returns:
+            Dictionary with results from each stage
+        """
+        results = {
+            'pipeline_config': {
+                'pre_processing': self.pipeline_stages['pre'],
+                'in_processing': self.pipeline_stages['in'],
+                'post_processing': self.pipeline_stages['post'],
+                'total_strategies': sum(len(v) for v in self.pipeline_stages.values())
+            },
+            'stage_results': {},
+            'final_output': None
+        }
+        
+        # Track data through pipeline
+        X_current = X_train.copy()
+        y_current = y_train.copy()
+        sensitive_current = sensitive_attr.copy()
+        y_pred_current = y_pred_test.copy() if y_pred_test is not None else None
+        
+        print(f"\n{'='*60}")
+        print(f"EXECUTING MITIGATION PIPELINE")
+        print(f"{'='*60}")
+        print(f"Pre-processing: {len(self.pipeline_stages['pre'])} strategies")
+        print(f"In-processing: {len(self.pipeline_stages['in'])} strategies")
+        print(f"Post-processing: {len(self.pipeline_stages['post'])} strategies")
+        print(f"{'='*60}\n")
+        
+        # Stage 1: Pre-processing
+        if self.pipeline_stages['pre']:
+            print(f"\n[STAGE 1: PRE-PROCESSING]")
+            pre_results = []
+            
+            for idx, strategy in enumerate(self.pipeline_stages['pre'], 1):
+                print(f"\n  [{idx}/{len(self.pipeline_stages['pre'])}] Applying: {strategy}")
+                
+                result = self.mitigator.run_mitigation_strategy(
+                    strategy,
+                    X_current,
+                    y_current,
+                    sensitive_current,
+                    X_test=X_test,
+                    y_test=y_test,
+                    y_pred_test=y_pred_current
+                )
+                
+                pre_results.append({
+                    'strategy': strategy,
+                    'result': result,
+                    'status': result.get('status', 'unknown')
+                })
+                
+                if result.get('status') == 'success':
+                    print(f"    ✅ Applied successfully")
+                else:
+                    print(f"    ❌ Failed: {result.get('error')}")
+            
+            results['stage_results']['pre_processing'] = pre_results
+        
+        # Stage 2: In-processing
+        if self.pipeline_stages['in']:
+            print(f"\n[STAGE 2: IN-PROCESSING]")
+            in_results = []
+            
+            for idx, strategy in enumerate(self.pipeline_stages['in'], 1):
+                print(f"\n  [{idx}/{len(self.pipeline_stages['in'])}] Applying: {strategy}")
+                
+                result = self.mitigator.run_mitigation_strategy(
+                    strategy,
+                    X_current,
+                    y_current,
+                    sensitive_current,
+                    X_test=X_test,
+                    y_test=y_test,
+                    y_pred_test=y_pred_current
+                )
+                
+                in_results.append({
+                    'strategy': strategy,
+                    'result': result,
+                    'status': result.get('status', 'unknown')
+                })
+                
+                if result.get('status') == 'success':
+                    print(f"    ✅ Applied successfully")
+                else:
+                    print(f"    ❌ Failed: {result.get('error')}")
+            
+            results['stage_results']['in_processing'] = in_results
+        
+        # Stage 3: Post-processing
+        if self.pipeline_stages['post']:
+            print(f"\n[STAGE 3: POST-PROCESSING]")
+            post_results = []
+            
+            for idx, strategy in enumerate(self.pipeline_stages['post'], 1):
+                print(f"\n  [{idx}/{len(self.pipeline_stages['post'])}] Applying: {strategy}")
+                
+                result = self.mitigator.run_mitigation_strategy(
+                    strategy,
+                    X_current,
+                    y_current,
+                    sensitive_current,
+                    X_test=X_test,
+                    y_test=y_test,
+                    y_pred_test=y_pred_current
+                )
+                
+                post_results.append({
+                    'strategy': strategy,
+                    'result': result,
+                    'status': result.get('status', 'unknown')
+                })
+                
+                if result.get('status') == 'success':
+                    print(f"    ✅ Applied successfully")
+                else:
+                    print(f"    ❌ Failed: {result.get('error')}")
+            
+            results['stage_results']['post_processing'] = post_results
+        
+        print(f"\n{'='*60}")
+        print(f"PIPELINE EXECUTION COMPLETE")
+        print(f"{'='*60}\n")
+        
+        results['final_output'] = {
+            'X_transformed': X_current,
+            'y_transformed': y_current,
+            'sensitive_transformed': sensitive_current,
+            'y_pred_transformed': y_pred_current
+        }
+        
+        return results
+    
+    def get_pipeline_summary(self) -> Dict:
+        """Get summary of the current pipeline configuration"""
+        return {
+            'total_strategies': sum(len(v) for v in self.pipeline_stages.values()),
+            'pre_processing': {
+                'count': len(self.pipeline_stages['pre']),
+                'strategies': self.pipeline_stages['pre']
+            },
+            'in_processing': {
+                'count': len(self.pipeline_stages['in']),
+                'strategies': self.pipeline_stages['in']
+            },
+            'post_processing': {
+                'count': len(self.pipeline_stages['post']),
+                'strategies': self.pipeline_stages['post']
+            }
+        }
     
 def _simple_equalized_odds_adjustment(
     y_pred: np.ndarray,
