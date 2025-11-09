@@ -85,6 +85,15 @@ async def apply_mitigation_strategy(request: MitigationRequest):
             train_df[request.sensitive_feature_column].values,
             request.sensitive_feature_column
         )
+
+        print(f"\n[SENSITIVE FEATURE ANALYSIS]")
+        print(f"  Column: {request.sensitive_feature_column}")
+        print(f"  Unique values: {np.unique(sensitive_attr)}")
+        print(f"  Number of groups: {len(np.unique(sensitive_attr))}")
+        for group in np.unique(sensitive_attr):
+            count = np.sum(sensitive_attr == group)
+            pct = (count / len(sensitive_attr)) * 100
+            print(f"  Group {group}: {count} samples ({pct:.1f}%)")
         
         # For post-processing, get predictions if available
         y_pred_original = None
@@ -129,9 +138,21 @@ async def apply_mitigation_strategy(request: MitigationRequest):
         # ===== STEP 2: Apply mitigation strategy =====
         print(f"\n[STEP 2] Applying mitigation strategy...")
         X_train_encoded = _encode_dataframe(X_train)
+        # Get model reference
+        model = None
+        if global_session.model_file_path:
+            try:
+                model = FileManager.load_model(global_session.model_file_path)
+                print(f"  ✅ Model loaded: {type(model).__name__}")
+            except Exception as e:
+                print(f"  ❌ Failed to load model: {str(e)}")
+                raise HTTPException(status_code=400, detail=f"Failed to load model: {str(e)}")
+        
+        if model is None:
+            raise HTTPException(status_code=400, detail="Model required for mitigation strategies")
 
         # Apply mitigation
-        mitigator = MitigationStrategies()
+        mitigator = MitigationStrategies(user_model=model)
         strategy_result = mitigator.run_mitigation_strategy(
             request.strategy,
             X_train_encoded,
@@ -142,23 +163,145 @@ async def apply_mitigation_strategy(request: MitigationRequest):
             y_pred_test=y_pred_original
         )
         
-        if strategy_result.get('status') == 'error':
-            raise HTTPException(status_code=400, detail=strategy_result.get('error'))
-        
-        # ===== STEP 3: Generate mitigated predictions =====
-        print(f"\n[STEP 3] Generating mitigated predictions...")
-        
-        # For simplification, we'll apply mild adjustments based on strategy type
-        y_pred_mitigated = _apply_mitigation_adjustment(
-            y_pred_original,
-            sensitive_attr,
-            strategy_result.get('type', 'post-processing'),
-            request.strategy
-        )
-        
-        # ===== STEP 4: Calculate MITIGATED bias metrics =====
-        print(f"\n[STEP 4] Calculating MITIGATED bias metrics...")
-        mitigated_bias = bias_detector.run_all_metrics(y_true, y_pred_mitigated, sensitive_attr)
+        # ===== CRITICAL: Handle transformed data for pre-processing =====
+        X_mitigated = X_train_encoded.copy()
+        y_pred_mitigated = y_pred_original.copy()
+
+        # Check what mitigator returned and use it
+        if mitigator.X_transformed is not None:
+            print(f"[USING] Transformed X from mitigator")
+            X_mitigated = mitigator.X_transformed
+            # CRITICAL FIX: Handle feature count mismatch
+            # AIF360 may return extra columns, extract only original features
+            num_original_features = X_train_encoded.shape[1]
+            
+            print(f"  Original features expected: {num_original_features}")
+            print(f"  Transformed X shape: {X_mitigated.shape}")
+            
+            # If transformed has more features than original, take only first n
+            if X_mitigated.shape[1] > num_original_features:
+                print(f"  Feature mismatch detected! Extracting first {num_original_features} features...")
+                X_mitigated = X_mitigated[:, :num_original_features]
+                print(f"  ✅ Adjusted to {X_mitigated.shape[1]} features")
+            
+            # Verify feature count now matches
+            if X_mitigated.shape[1] != num_original_features:
+                print(f"  ⚠️ WARNING: Feature count still doesn't match!")
+                print(f"  Using original X instead of transformed")
+                X_mitigated = X_train_encoded
+            
+            print(f"  Predicting on transformed X...")
+            try:
+                y_pred_mitigated = model.predict(X_mitigated)
+                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+                print(f"  ✅ Got predictions from transformed X")
+            except Exception as e:
+                print(f"  [ERROR] Could not predict on transformed X: {str(e)}")
+                print(f"  Falling back to original X")
+                X_mitigated = X_train_encoded
+                y_pred_mitigated = model.predict(X_mitigated)
+                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+
+        elif mitigator.sample_weights is not None:
+            # ADD THIS SECTION - Handle Reweighing
+            print(f"[USING] Reweighted samples from mitigator")
+            print(f"  Weights: min={mitigator.sample_weights.min():.3f}, max={mitigator.sample_weights.max():.3f}, mean={mitigator.sample_weights.mean():.3f}")
+            
+            try:
+                # Clone model and retrain with weights
+                import copy
+                model_reweighted = copy.deepcopy(model)
+                
+                print(f"  Retraining model with weights...")
+                
+                # Check if model supports sample_weight
+                if hasattr(model_reweighted, 'fit'):
+                    # Try to fit with sample_weight
+                    try:
+                        model_reweighted.fit(X_train_encoded, y_true, sample_weight=mitigator.sample_weights)
+                        print(f"  ✅ Retrained with sample weights")
+                    except TypeError:
+                        print(f"  [WARNING] Model doesn't support sample_weight in fit. Using as-is.")
+                
+                # Get predictions from reweighted model
+                y_pred_mitigated = model_reweighted.predict(X_train_encoded)
+                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+                print(f"  Generated predictions from reweighted model")
+                
+            except Exception as e:
+                print(f"  [ERROR] Reweighting failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                y_pred_mitigated = y_pred_original
+            
+        elif mitigator.model_modified:
+            print(f"[USING] Modified model from mitigator")
+
+            # CRITICAL: Check if mitigator has a fine-tuned model stored
+            if hasattr(mitigator, 'fine_tuned_model') and mitigator.fine_tuned_model is not None:
+                print(f"  Using stored fine-tuned model")
+                model_to_use = mitigator.fine_tuned_model
+            else:
+                print(f"  Using mitigator.user_model")
+                model_to_use = mitigator.user_model
+                
+            # Get predictions from fine-tuned model
+            y_pred_mitigated = model_to_use.predict(X_train_encoded)
+            y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+
+            print(f"  ✅ Generated {len(y_pred_mitigated)} predictions from fine-tuned model")
+            
+        elif mitigator.y_pred_adjusted is not None:
+            print(f"[USING] Adjusted predictions from mitigator")
+            y_pred_mitigated = mitigator.y_pred_adjusted
+            y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+
+        # Validate strategy result
+        if strategy_result.get('status') not in ['success', 'partial']:
+            raise HTTPException(status_code=400, detail=f"Strategy failed: {strategy_result.get('error')}")
+
+        # ===== STEP 3: Calculate MITIGATED bias metrics =====
+        print(f"\n[STEP 3] Calculating MITIGATED bias metrics...")
+
+        # For data augmentation, use augmented y_true and sensitive_attr
+        y_true_for_metrics = y_true.copy()
+        sensitive_attr_for_metrics = sensitive_attr.copy()
+
+        if hasattr(mitigator, 'y_augmented') and mitigator.y_augmented is not None:
+            print(f"  Using AUGMENTED targets for metrics (size changed from {len(y_true)} to {len(mitigator.y_augmented)})")
+            y_true_for_metrics = np.array(mitigator.y_augmented)
+            sensitive_attr_for_metrics = np.array(mitigator.sensitive_augmented)
+
+        print(f"  Data shapes: y_true={len(y_true_for_metrics)}, y_pred={len(y_pred_mitigated)}, sensitive={len(sensitive_attr_for_metrics)}")
+
+        # Validate sizes match BEFORE calling bias_detector
+        print(f"\n[VALIDATION] Checking size alignment:")
+        print(f"  y_true: {len(y_true_for_metrics)}")
+        print(f"  y_pred_mitigated: {len(y_pred_mitigated)}")
+        print(f"  sensitive_attr: {len(sensitive_attr_for_metrics)}")
+            
+        # Validate sizes match
+        if len(y_pred_mitigated) != len(y_true_for_metrics):
+            print(f"  ⚠️ Size mismatch: predictions={len(y_pred_mitigated)}, targets={len(y_true_for_metrics)}")
+            # Take only first len(y_true_for_metrics) predictions if needed
+            if len(y_pred_mitigated) > len(y_true_for_metrics):
+                print(f"  Truncating predictions to match target size...")
+                y_pred_mitigated = y_pred_mitigated[:len(y_true_for_metrics)]
+            elif len(y_pred_mitigated) < len(y_true_for_metrics):
+                print(f"  ⚠️ ERROR: Not enough predictions!")
+                raise ValueError(f"Predictions ({len(y_pred_mitigated)}) < targets ({len(y_true_for_metrics)})")
+            
+        if len(sensitive_attr_for_metrics) != len(y_true_for_metrics):
+            print(f"  ⚠️ ERROR: Sensitive attr size mismatch!")
+            raise ValueError(f"Sensitive attr ({len(sensitive_attr_for_metrics)}) != targets ({len(y_true_for_metrics)})")
+
+        print(f"  ✅ All shapes validated - proceeding with metrics")
+        print(f"\n[CALLING] bias_detector.run_all_metrics with:")
+        print(f"  y_true: {type(y_true_for_metrics).__name__} shape {y_true_for_metrics.shape}")
+        print(f"  y_pred_mitigated: {type(y_pred_mitigated).__name__} shape {y_pred_mitigated.shape}")
+        print(f"  sensitive_attr: {type(sensitive_attr_for_metrics).__name__} shape {sensitive_attr_for_metrics.shape}")
+
+        mitigated_bias = bias_detector.run_all_metrics(y_true_for_metrics, y_pred_mitigated, sensitive_attr_for_metrics)
         mitigated_bias = _clean_nan_values(mitigated_bias)
         
         mitigated_biased_count = mitigated_bias['summary']['biased_metrics_count']
@@ -167,17 +310,16 @@ async def apply_mitigation_strategy(request: MitigationRequest):
         print(f"  Biased metrics count: {mitigated_biased_count}")
         print(f"  Biased metrics: {mitigated_biased_metrics}")
         
-        # ===== STEP 5: Calculate improvements =====
-        print(f"\n[STEP 5] Calculating improvements...")
+        # ===== STEP 4: Calculate improvements =====
+        print(f"\n[STEP 4] Calculating improvements...")
         improvement = baseline_biased_count - mitigated_biased_count
         
-        # Calculate detailed metric improvements
         metric_improvements = _calculate_metric_improvements(baseline_bias, mitigated_bias)
         
         print(f"  Overall improvement: {improvement} fewer biased metrics")
-        print(f"  Status: {'IMPROVED' if improvement > 0 else ('❌ WORSENED' if improvement < 0 else '➡️ NO CHANGE')}")
+        print(f"  Status: {'✅ IMPROVED' if improvement > 0 else ('❌ WORSENED' if improvement < 0 else '➡️ NO CHANGE')}")
         
-        # Clean strategy result for JSON serialization
+        # Clean strategy result for JSON
         strategy_result_clean = _serialize_mitigation_result(strategy_result)
         
         # Build response
@@ -217,7 +359,7 @@ async def apply_mitigation_strategy(request: MitigationRequest):
             )
         }
         
-        print(f"\n{'='*60}")
+        print(f"\n{'='*60}\n")
         
         return response
     
@@ -290,7 +432,7 @@ async def compare_strategies(request: StrategyComparisonRequest):
         if request.strategies:
             strategies_to_run = request.strategies
         else:
-            mitigator = MitigationStrategies()
+            mitigator = MitigationStrategies(user_model=model)
             strategies_to_run = list(mitigator.strategies.keys())
 
         print(f"\n[STRATEGIES] Evaluating {len(strategies_to_run)} strategies...")
@@ -307,7 +449,7 @@ async def compare_strategies(request: StrategyComparisonRequest):
         X_train = train_df.drop(columns=[global_session.target_column]).copy()
         X_train_encoded = _encode_dataframe(X_train)
         
-        mitigator = MitigationStrategies()
+        mitigator = MitigationStrategies(user_model=model)
         
         for idx, strategy_name in enumerate(strategies_to_run, 1):
             print(f"\n[{idx}/{len(strategies_to_run)}] Evaluating: {strategy_name}")
@@ -404,6 +546,54 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
     Shows bias metrics before and after the full pipeline
     """
     try:
+        print(f"\n{'='*60}")
+        print(f"MITIGATION PIPELINE REQUEST")
+        print(f"{'='*60}")
+        
+        # ADD THIS VALIDATION:
+        if request.sensitive_feature_column is None or request.sensitive_feature_column.strip() == '':
+            raise HTTPException(
+                status_code=400,
+                detail="sensitive_feature_column is required and cannot be empty"
+            )
+        
+        if request.sensitive_feature_column == 'string':
+            raise HTTPException(
+                status_code=400,
+                detail="sensitive_feature_column cannot be the literal string 'string'. Please provide an actual column name"
+            )
+        
+        print(f"Request parameters:")
+
+        # Check which attributes exist
+        if hasattr(request, 'strategies'):
+            strategies = request.strategies
+            print(f"  Strategies: {strategies}")
+        elif hasattr(request, 'pipeline'):
+            strategies = []  # Convert single to list
+            for stage in ['pre', 'in', 'post']:
+                if stage in request.pipeline:
+                    strategies.extend(request.pipeline[stage])
+            print(f"  Strategies from pipeline: {strategies}")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Request must contain 'strategies' or 'strategy' field"
+            )
+
+        if hasattr(request, 'sensitive_feature_column'):
+            sensitive_feature = request.sensitive_feature_column
+        else:
+            raise HTTPException(status_code=400, detail="sensitive_feature_column is required")
+
+        if hasattr(request, 'prediction_column'):
+            prediction_column = request.prediction_column
+        else:
+            prediction_column = None
+
+        print(f"  Sensitive feature: {sensitive_feature}")
+        print(f"  Prediction column: {prediction_column}")
+
         if global_session.train_file_path is None:
             raise HTTPException(status_code=400, detail="Training data must be uploaded first")
         
@@ -419,11 +609,30 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
             train_df[global_session.target_column].values,
             "y_true"
         )
+
+        # Validate sensitive_feature_column exists
+        if request.sensitive_feature_column not in train_df.columns:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Sensitive feature column '{request.sensitive_feature_column}' not found in data. Available columns: {list(train_df.columns)}"
+            )
+
+        print(f"\n[INFO] Sensitive feature column: {request.sensitive_feature_column}")
+        print(f"  Available columns: {list(train_df.columns)}")
         
         sensitive_attr = _safe_convert_to_numeric(
             train_df[request.sensitive_feature_column].values,
             request.sensitive_feature_column
         )
+
+        print(f"\n[SENSITIVE FEATURE ANALYSIS]")
+        print(f"  Column: {request.sensitive_feature_column}")
+        print(f"  Unique values: {np.unique(sensitive_attr)}")
+        print(f"  Number of groups: {len(np.unique(sensitive_attr))}")
+        for group in np.unique(sensitive_attr):
+            count = np.sum(sensitive_attr == group)
+            pct = (count / len(sensitive_attr)) * 100
+            print(f"  Group {group}: {count} samples ({pct:.1f}%)")
         
         # Get predictions
         if request.prediction_column and request.prediction_column.strip():
@@ -447,6 +656,10 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
         # Calculate BASELINE bias metrics
         print(f"\n[BASELINE] Calculating original bias metrics...")
         bias_detector = BiasDetector()
+
+        # Store original sensitive_attr in detector (for later use)
+        bias_detector.sensitive_attr_original = sensitive_attr.copy() 
+        
         baseline_bias = bias_detector.run_all_metrics(y_true, y_pred, sensitive_attr)
         baseline_bias = _clean_nan_values(baseline_bias)
         
@@ -469,9 +682,25 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
         
         # Get pipeline summary
         pipeline_summary = pipeline.get_pipeline_summary()
+
+        # Get model for strategies
+        model = None
+        if global_session.model_file_path:
+            model = FileManager.load_model(global_session.model_file_path)
+
+        if model is None:
+            raise HTTPException(status_code=400, detail="Model required for mitigation strategies")
+
+        print(f"\n[PIPELINE SETUP]")
+        print(f"  Strategies to apply: {strategies}")
+        print(f"  Model type: {type(model).__name__}")
         
         # Encode data
         X_train_encoded = _encode_dataframe(X_train)
+
+        # Generate mitigated predictions (simplified for demo)
+        y_pred_current = y_pred.copy()
+        pipeline_stages = []
         
         # Execute pipeline
         pipeline_results = pipeline.execute_pipeline(
@@ -483,30 +712,154 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
             y_pred_test=y_pred
         )
         
-        # Generate mitigated predictions (simplified for demo)
-        y_pred_mitigated = y_pred.copy()
-        for stage_name, stage_results in pipeline_results['stage_results'].items():
-            for result in stage_results:
-                if result['status'] == 'success':
-                    # Apply mild adjustment per strategy
-                    strategy_name = result['strategy']
-                    strategy_type = result['result'].get('type', 'post-processing')
-                    y_pred_mitigated = _apply_mitigation_adjustment(
-                        y_pred_mitigated,
-                        sensitive_attr,
-                        strategy_type,
-                        strategy_name
-                    )
+        X_train_transformed = X_train_encoded.copy()
+        # Track augmented data when it changes
+        y_true_current = y_true.copy()
+        sensitive_attr_current = sensitive_attr.copy()
+        # Apply each strategy in sequence
+        for idx, strategy in enumerate(strategies, 1):
+            print(f"\n{'='*60}")
+            print(f"[STAGE {idx}/{len(strategies)}] {strategy.upper()}")
+            print(f"{'='*60}")
+            
+            try:
+                # Verify model exists
+                if model is None:
+                    print(f"  ⚠️ WARNING: Model is None, skipping strategy {strategy}")
+                    stage_result = {
+                        'stage_number': idx,
+                        'strategy': strategy,
+                        'status': 'skipped',
+                        'reason': 'Model not available'
+                    }
+                    pipeline_stages.append(stage_result)
+                    continue
+                # Apply mitigation
+                mitigator = MitigationStrategies(user_model=model)
+                print(f"  Model type: {type(model).__name__}")
+
+                strategy_result = mitigator.run_mitigation_strategy(
+                    strategy,
+                    X_train_encoded,
+                    y_true_current,  # Use current (possibly augmented) y_true
+                    sensitive_attr_current,  # Use current (possibly augmented) sensitive_attr
+                    X_test=X_train_encoded,
+                    y_test=y_true,
+                    y_pred_test=y_pred_current
+                )
+                
+                # Store stage result
+                stage_result = {
+                    'stage_number': idx,
+                    'strategy': strategy,
+                    'status': strategy_result.get('status'),
+                    'type': strategy_result.get('type'),
+                    'message': strategy_result.get('message', '')
+                }
+                pipeline_stages.append(stage_result)
+                
+                print(f"  Status: {strategy_result.get('status')}")
+                
+                # Extract mitigated predictions based on strategy type and handle size changes
+                if mitigator.y_augmented is not None:
+                    print(f"  Data was augmented: {len(y_true_current)} → {len(mitigator.y_augmented)}")
+                    y_true_current = np.array(mitigator.y_augmented)
+                    sensitive_attr_current = np.array(mitigator.sensitive_augmented)
+                    
+                    # Use augmented X for predictions
+                    if hasattr(mitigator, 'X_augmented') and mitigator.X_augmented is not None:
+                        print(f"  Using augmented X data for predictions")
+                        X_augmented_encoded = _encode_dataframe(pd.DataFrame(mitigator.X_augmented))
+                        y_pred_current = model.predict(X_augmented_encoded)
+                    else:
+                        # Fallback if X_augmented not available
+                        y_pred_current = model.predict(X_train_encoded)
+
+                    y_pred_current = _safe_convert_to_numeric(y_pred_current, "predictions")
+                    
+                    print(f"  Now using augmented data: {len(y_pred_current)} predictions")
+
+                elif mitigator.y_pred_adjusted is not None:
+                    print(f"  Using adjusted predictions")
+                    y_pred_current = mitigator.y_pred_adjusted
+                
+                elif mitigator.X_transformed is not None:
+                    print(f"  Using transformed data for predictions")
+                    X_train_encoded_temp = mitigator.X_transformed
+                    
+                    # Handle feature mismatch
+                    num_original_features = X_train_encoded.shape[1]
+                    if X_train_encoded_temp.shape[1] > num_original_features:
+                        X_train_encoded_temp = X_train_encoded_temp[:, :num_original_features]
+                    
+                    y_pred_current = model.predict(X_train_encoded_temp)
+                    y_pred_current = _safe_convert_to_numeric(y_pred_current, "predictions")
+                
+                elif mitigator.model_modified:
+                    print(f"  Using fine-tuned model")
+                    if hasattr(mitigator, 'fine_tuned_model') and mitigator.fine_tuned_model is not None:
+                        y_pred_current = mitigator.fine_tuned_model.predict(X_train_encoded)
+                    else:
+                        y_pred_current = model.predict(X_train_encoded)
+                    y_pred_current = _safe_convert_to_numeric(y_pred_current, "predictions")
+                
+            except Exception as e:
+                print(f"[ERROR] {strategy} failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                stage_result = {
+                    'stage_number': idx,
+                    'strategy': strategy,
+                    'status': 'error',
+                    'error': str(e)
+                }
+                pipeline_stages.append(stage_result)
+                # Continue to next strategy even if one fails
+                continue
+
+        # Final mitigated predictions
+        y_pred_mitigated = y_pred_current
+
+        # CRITICAL: Validate sizes match before calculating metrics
+        print(f"\n[VALIDATION] Final size check before metrics:")
+        print(f"  y_true_current: {len(y_true_current)}")
+        print(f"  y_pred_mitigated: {len(y_pred_mitigated)}")
+        print(f"  sensitive_attr_current: {len(sensitive_attr_current)}")
+
+        if len(y_pred_mitigated) != len(y_true_current):
+            print(f"  ⚠️ Size mismatch! Truncating predictions to match targets")
+            y_pred_mitigated = y_pred_mitigated[:len(y_true_current)]
         
         # Calculate MITIGATED bias metrics
         print(f"\n[AFTER PIPELINE] Calculating mitigated bias metrics...")
-        mitigated_bias = bias_detector.run_all_metrics(y_true, y_pred_mitigated, sensitive_attr)
+        mitigated_bias = bias_detector.run_all_metrics(y_true_current, y_pred_mitigated, sensitive_attr_current)
         mitigated_bias = _clean_nan_values(mitigated_bias)
+
+        print(f"\n{'='*60}")
+        print(f"BIAS ASSESSMENT COMPARISON")
+        print(f"{'='*60}")
+
+        # Get summary info
+        baseline_summary = baseline_bias.get('summary', {})
+        mitigated_summary = mitigated_bias.get('summary', {})
+
+        print(f"\nBaseline Summary:")
+        print(f"  Overall Status: {baseline_summary.get('overall_bias_status')}")
+        print(f"  Biased Metrics Count: {baseline_summary.get('biased_metrics_count')}")
+        print(f"  Biased Metrics: {baseline_summary.get('biased_metrics')}")
+
+        print(f"\nMitigated Summary:")
+        print(f"  Overall Status: {mitigated_summary.get('overall_bias_status')}")
+        print(f"  Biased Metrics Count: {mitigated_summary.get('biased_metrics_count')}")
+        print(f"  Biased Metrics: {mitigated_summary.get('biased_metrics')}")
         
+        baseline_biased_count = baseline_summary.get('biased_metrics_count', 0)
         mitigated_biased_count = mitigated_bias['summary']['biased_metrics_count']
         improvement = baseline_biased_count - mitigated_biased_count
         
-        print(f"  Mitigated biased metrics: {mitigated_biased_count}")
+        print(f"\nImprovement:")
+        print(f"  Metrics before: {baseline_biased_count}")
+        print(f"  Metrics after: {mitigated_biased_count}")
         print(f"  Overall improvement: {improvement}")
         
         # Calculate detailed metric improvements
@@ -517,8 +870,15 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
         
         response = {
             'status': 'success',
-            'pipeline_config': pipeline_summary,
-            'pipeline_execution': pipeline_results_clean,
+            'pipeline_config': {
+                'strategies': strategies,
+                'sensitive_feature': sensitive_feature,
+                'total_stages': len(strategies)
+            },
+            'pipeline_execution': {
+                'stages': pipeline_stages,
+                'total_stages_executed': len([s for s in pipeline_stages if s.get('status') in ['success', 'partial']])
+            },
             
             'bias_assessment': {
                 'baseline': {
@@ -588,6 +948,15 @@ async def compare_mitigation_pipelines(request: PipelineComparisonRequest):
             train_df[request.sensitive_feature_column].values,
             request.sensitive_feature_column
         )
+
+        print(f"\n[SENSITIVE FEATURE ANALYSIS]")
+        print(f"  Column: {request.sensitive_feature_column}")
+        print(f"  Unique values: {np.unique(sensitive_attr)}")
+        print(f"  Number of groups: {len(np.unique(sensitive_attr))}")
+        for group in np.unique(sensitive_attr):
+            count = np.sum(sensitive_attr == group)
+            pct = (count / len(sensitive_attr)) * 100
+            print(f"  Group {group}: {count} samples ({pct:.1f}%)")
         
         # Get predictions
         if request.prediction_column and request.prediction_column.strip():
@@ -820,21 +1189,49 @@ async def optimize_pipeline(request: OptimizationRequest):
             train_df[request.sensitive_feature_column].values,
             request.sensitive_feature_column
         )
+
+        print(f"\n[SENSITIVE FEATURE ANALYSIS]")
+        print(f"  Column: {request.sensitive_feature_column}")
+        print(f"  Unique values: {np.unique(sensitive_attr)}")
+        print(f"  Number of groups: {len(np.unique(sensitive_attr))}")
+        for group in np.unique(sensitive_attr):
+            count = np.sum(sensitive_attr == group)
+            pct = (count / len(sensitive_attr)) * 100
+            print(f"  Group {group}: {count} samples ({pct:.1f}%)")
+
+        # Load model first (needed for optimization strategies)
+        print(f"\n[MODEL LOADING]")
+        model = None
+        if global_session.model_file_path:
+            try:
+                model = FileManager.load_model(global_session.model_file_path)
+                print(f"  ✅ Model loaded: {type(model).__name__}")
+            except Exception as e:
+                print(f"  ⚠️ Failed to load model: {str(e)}")
+                model = None
         
         # Get predictions
         if request.prediction_column and request.prediction_column.strip():
+            print(f"  Using prediction_column: {request.prediction_column}")
             y_pred = _safe_convert_to_numeric(
                 train_df[request.prediction_column].values,
                 request.prediction_column
             )
-        elif global_session.model_file_path:
-            model = FileManager.load_model(global_session.model_file_path)
+        elif model is not None:
+            print(f"  Using model predictions")
             X_test = train_df.drop(columns=[global_session.target_column]).copy()
             X_test_encoded = _encode_dataframe(X_test)
             y_pred = model.predict(X_test_encoded)
             y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
         else:
             raise HTTPException(status_code=400, detail="Either prediction_column or uploaded model required")
+        
+        # Validate model is available for optimization
+        if model is None:
+            raise HTTPException(
+                status_code=400, 
+                detail="Model is required for optimization (upload model or ensure it was saved). Strategies like fairness_regularization and threshold_optimization require a model."
+            )
         
         # Calculate baseline
         bias_detector = BiasDetector()
@@ -847,16 +1244,16 @@ async def optimize_pipeline(request: OptimizationRequest):
         
         # Run optimization
         from app.pipeline_optimizer import PipelineOptimizer
-        optimizer = PipelineOptimizer()
+        optimizer = PipelineOptimizer(bias_detector=bias_detector, user_model=model)
         
         if request.method == 'greedy':
-            result = optimizer.greedy_search(
+            result = optimizer.stage_wise_greedy_search(
                 X_train_encoded,
                 y_true,
                 sensitive_attr,
                 y_pred,
-                baseline_biased_count,
-                max_strategies=request.max_strategies or 3
+                baseline_biased_count
+                # max_strategies=request.max_strategies or 3
             )
         
         elif request.method == 'top_k':
@@ -985,7 +1382,10 @@ def _apply_mitigation_adjustment(
     y_pred: np.ndarray,
     sensitive_attr: np.ndarray,
     strategy_type: str,
-    strategy_name: str
+    strategy_name: str,
+    y_true: np.ndarray = None,
+    X_transformed: np.ndarray = None,
+    model = None
 ) -> np.ndarray:
     """
     Apply prediction adjustments based on mitigation strategy
@@ -993,45 +1393,63 @@ def _apply_mitigation_adjustment(
     y_pred_adjusted = y_pred.copy().astype(float)
     
     if strategy_type == 'pre-processing':
-        # Pre-processing: minor adjustment as data is already cleaned
-        print(f"  Pre-processing strategy detected - minimal prediction adjustment")
+        print(f"  Pre-processing strategy detected")
+        
+        # If we have transformed data and model, use it for new predictions
+        if X_transformed is not None and model is not None:
+            print(f"    Using model to predict on transformed data...")
+            y_pred_adjusted = model.predict(X_transformed).astype(float)
+        
+        # Otherwise, apply fairness-aware adjustments to existing predictions
+        elif strategy_name == 'disparate_impact_remover':
+            print(f"    Applying disparate impact adjustments...")
+            # Flip predictions for underrepresented groups to balance outcomes
+            for group in np.unique(sensitive_attr):
+                group_mask = sensitive_attr == group
+                group_positive_rate = np.mean(y_pred[group_mask])
+                
+                # If this group has very low positive rate, increase it slightly
+                if group_positive_rate < 0.3:
+                    flip_indices = np.where(group_mask & (y_pred == 0))[0]
+                    if len(flip_indices) > 0:
+                        num_flips = int(len(flip_indices) * 0.15)  # Flip 15%
+                        flip_idx = np.random.choice(flip_indices, size=num_flips, replace=False)
+                        y_pred_adjusted[flip_idx] = 1
+                        print(f"      Group {group}: flipped {num_flips} predictions")
+        
+        elif strategy_name == 'data_augmentation':
+            print(f"    Applying data augmentation adjustments...")
+            # Balanced representation - adjust predictions to reflect balance
+            pass
+        
+        return y_pred_adjusted.astype(int)
+    
+    elif strategy_type == 'in-processing':
+        print(f"  In-processing strategy detected")
+        # Model was already fine-tuned, predictions remain same
         return y_pred_adjusted.astype(int)
     
     elif strategy_type == 'post-processing':
         print(f"  Post-processing strategy detected - applying threshold adjustments")
         
-        # Adjust threshold per group
-        group_0_mask = sensitive_attr == 0
-        group_1_mask = sensitive_attr == 1
-        
         if strategy_name == 'threshold_optimization':
-            # For group 0: lower threshold (make more positive predictions)
-            # For group 1: higher threshold (make fewer positive predictions)
-            y_pred_adjusted[group_0_mask] = np.where(
-                y_pred[group_0_mask] >= 0.4,
-                1,
-                y_pred[group_0_mask]
-            )
-            y_pred_adjusted[group_1_mask] = np.where(
-                y_pred[group_1_mask] >= 0.6,
-                1,
-                y_pred[group_1_mask]
-            )
+            # Adjust thresholds per group
+            for group in np.unique(sensitive_attr):
+                group_mask = sensitive_attr == group
+                group_pred = y_pred[group_mask]
+                
+                threshold = np.percentile(group_pred, 50)
+                y_pred_adjusted[group_mask] = (group_pred > threshold).astype(float)
+                print(f"      Group {group}: threshold = {threshold:.3f}")
         
         elif strategy_name == 'calibration_adjustment':
-            # Smooth calibration
+            # Smooth predictions
             y_pred_adjusted = 0.9 * y_pred_adjusted + 0.1 * np.random.random(len(y_pred))
             y_pred_adjusted = np.clip(y_pred_adjusted, 0, 1)
         
-        elif strategy_name == 'equalized_odds_postprocessing':
-            # Flip some predictions for balance
-            flip_rate = 0.05
-            flip_indices = np.random.choice(len(y_pred), size=int(len(y_pred) * flip_rate), replace=False)
-            y_pred_adjusted[flip_indices] = 1 - y_pred_adjusted[flip_indices]
-        
-        return np.round(y_pred_adjusted).astype(int)
+        return y_pred_adjusted.astype(int)
     
-    return y_pred
+    return y_pred_adjusted.astype(int)
 
 
 def _calculate_metric_improvements(baseline_bias: Dict, mitigated_bias: Dict) -> Dict:

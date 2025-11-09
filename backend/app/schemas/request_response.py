@@ -71,3 +71,77 @@ class BiasAnalysisResponse(BaseModel):
     overall_bias_status: str
     metrics_results: Dict[str, Any]
     recommendations: List[str]
+
+class PipelineRequest(BaseModel):
+    """Request for mitigation pipeline - apply multiple strategies in sequence"""
+    
+    strategies: List[str] = Field(
+        ...,
+        description="List of mitigation strategies to apply in order",
+        example=["disparate_impact_remover", "data_augmentation"]
+    )
+    
+    sensitive_feature_column: str = Field(
+        ...,
+        description="Column name of the sensitive attribute to mitigate for (e.g., 'experience', 'gender', 'race')",
+        example="experience"
+    )
+    
+    prediction_column: Optional[str] = Field(
+        None,
+        description="Column name containing predictions (optional - if not provided, model will be used)",
+        example=""
+    )
+
+
+class MitigationRequest(BaseModel):
+    """Request for a single mitigation strategy"""
+    
+    strategy: str = Field(
+        ...,
+        description="Mitigation strategy to apply",
+        example="disparate_impact_remover"
+    )
+    
+    sensitive_feature_column: str = Field(
+        ...,
+        description="Column name of the sensitive attribute",
+        example="experience"
+    )
+    
+    prediction_column: Optional[str] = Field(
+        None,
+        description="Column name containing predictions",
+        example=""
+    )
+
+
+class BiasDetectionResponse(BaseModel):
+    """Response from bias detection"""
+    
+    status: str = Field(..., description="Status of detection (BIASED or FAIR)")
+    biased_metrics_count: int = Field(..., description="Number of biased metrics found")
+    biased_metrics: List[str] = Field(..., description="List of biased metrics")
+    metrics: Dict[str, Any] = Field(..., description="Detailed metrics")
+
+
+class MitigationResponse(BaseModel):
+    """Response from mitigation"""
+    
+    status: str = Field(..., description="Success or error status")
+    strategy_applied: str = Field(..., description="Strategy that was applied")
+    bias_assessment: Dict[str, Any] = Field(..., description="Baseline and mitigated bias metrics")
+    improvement_analysis: Dict[str, Any] = Field(..., description="Analysis of improvements")
+    recommendations: Optional[List[str]] = Field(None, description="Recommendations for further improvement")
+
+
+class PipelineResponse(BaseModel):
+    """Response from mitigation pipeline"""
+    
+    status: str = Field(..., description="Overall pipeline status")
+    strategies_applied: List[str] = Field(..., description="Strategies that were applied")
+    initial_bias: Dict[str, Any] = Field(..., description="Initial bias metrics")
+    final_bias: Dict[str, Any] = Field(..., description="Final bias metrics after all strategies")
+    overall_improvement: int = Field(..., description="Number of biased metrics reduced")
+    stage_results: Dict[str, Any] = Field(..., description="Results from each stage")
+    recommendations: Optional[List[str]] = Field(None, description="Recommendations")
