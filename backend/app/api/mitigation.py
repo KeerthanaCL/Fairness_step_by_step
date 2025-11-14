@@ -13,8 +13,56 @@ from app.api.bias import (
     _clean_nan_values,
     _generate_recommendations
 )
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/mitigation", tags=["Mitigation Strategies"])
+
+def _load_and_prepare(train_required=True, require_model=False, prediction_column=None, sensitive_feature_column=None):
+    """
+    Helper: Loads train_df from FileManager, validates, returns:
+    train_df, X, y_true (int array), sensitive_attr (int array or None), model (or None), X_encoded
+    Raises HTTPException on validation failures.
+    """
+    if global_session.train_file_path is None:
+        raise HTTPException(status_code=400, detail="Training data must be uploaded first")
+
+    train_df = FileManager.load_csv(global_session.train_file_path)
+
+    if global_session.target_column is None:
+        raise HTTPException(status_code=400, detail="Target column must be set first")
+
+    # Prepare data
+    X = train_df.drop(columns=[global_session.target_column]).copy()
+    y_true = _safe_convert_to_numeric(train_df[global_session.target_column].values, "y_true")
+
+    model = None
+    if global_session.model_file_path:
+        try:
+            model = FileManager.load_model(global_session.model_file_path)
+            logger.info("Loaded user model for mitigation")
+        except Exception as e:
+            logger.warning(f"Failed to load user model: {e}")
+            model = None
+
+    sensitive_attr = None
+    if sensitive_feature_column:
+        if sensitive_feature_column not in train_df.columns:
+            raise HTTPException(status_code=400, detail=f"Sensitive feature column '{sensitive_feature_column}' not found in data. Available columns: {list(train_df.columns)}")
+        sensitive_attr = _safe_convert_to_numeric(train_df[sensitive_feature_column].values, sensitive_feature_column)
+
+    # Predictions if requested (prediction_column takes precedence)
+    y_pred = None
+    if prediction_column and prediction_column.strip():
+        if prediction_column not in train_df.columns:
+            raise HTTPException(status_code=400, detail=f"Prediction column '{prediction_column}' not found")
+        y_pred = _safe_convert_to_numeric(train_df[prediction_column].values, prediction_column)
+    elif model is not None:
+        X_encoded = _encode_dataframe(X)
+        y_pred = _safe_convert_to_numeric(model.predict(X_encoded), "model_prediction")
+
+    X_encoded = _encode_dataframe(X)
+    return train_df, X, X_encoded, y_true, sensitive_attr, model, y_pred
 
 class MitigationRequest(BaseModel):
     strategy: str
@@ -63,93 +111,27 @@ async def get_available_strategies():
 async def apply_mitigation_strategy(request: MitigationRequest):
     """
     Apply a specific mitigation strategy and show before/after bias metrics
+    Uses _load_and_prepare to centralize loading/validation and enforce consistent encodings.
     """
     try:
-        if global_session.train_file_path is None:
-            raise HTTPException(status_code=400, detail="Training data must be uploaded first")
-        
-        if global_session.target_column is None:
-            raise HTTPException(status_code=400, detail="Target column must be set first")
-        
-        # Load data
-        train_df = FileManager.load_csv(global_session.train_file_path)
-        
-        # Prepare data
-        X_train = train_df.drop(columns=[global_session.target_column]).copy()
-        y_true = _safe_convert_to_numeric(
-            train_df[global_session.target_column].values,
-            "y_true"
-        )
-        
-        sensitive_attr = _safe_convert_to_numeric(
-            train_df[request.sensitive_feature_column].values,
-            request.sensitive_feature_column
+        # Centralized load/prepare
+        train_df, X_train, X_train_encoded, y_true, sensitive_attr, model, y_pred_original = _load_and_prepare(
+            prediction_column=request.prediction_column,
+            sensitive_feature_column=request.sensitive_feature_column
         )
 
-        print(f"\n[SENSITIVE FEATURE ANALYSIS]")
-        print(f"  Column: {request.sensitive_feature_column}")
-        print(f"  Unique values: {np.unique(sensitive_attr)}")
-        print(f"  Number of groups: {len(np.unique(sensitive_attr))}")
-        for group in np.unique(sensitive_attr):
-            count = np.sum(sensitive_attr == group)
-            pct = (count / len(sensitive_attr)) * 100
-            print(f"  Group {group}: {count} samples ({pct:.1f}%)")
-        
-        # For post-processing, get predictions if available
-        y_pred_original = None
-        if request.prediction_column and request.prediction_column.strip():
-            # Use prediction column from data
-            print(f"[INFO] Using prediction_column: {request.prediction_column}")
-            if request.prediction_column not in train_df.columns:
-                raise HTTPException(status_code=400, detail=f"Prediction column '{request.prediction_column}' not found")
-            y_pred_original = _safe_convert_to_numeric(
-                train_df[request.prediction_column].values,
-                request.prediction_column
-            )
+        # If model-based strategies are required, ensure model present
+        if model is None:
+            raise HTTPException(status_code=400, detail="Model required for mitigation strategies")
 
-        elif global_session.model_file_path:
-            # Use uploaded model for predictions
-            print(f"[INFO] Using model predictions from uploaded model")
-            model = FileManager.load_model(global_session.model_file_path)
-            X_test = train_df.drop(columns=[global_session.target_column]).copy()
-            X_test_encoded = _encode_dataframe(X_test)
-            y_pred_original = model.predict(X_test_encoded)
-            y_pred_original = _safe_convert_to_numeric(y_pred_original, "model_prediction")
+        logger.info(f"Applying mitigation strategy: {request.strategy} on sensitive feature: {request.sensitive_feature_column}")
 
-        else:
-            raise HTTPException(status_code=400, detail="Prediction column required for bias calculation")
-        
-        print(f"\n{'='*60}")
-        print(f"MITIGATION STRATEGY: {request.strategy.upper()}")
-        print(f"{'='*60}")
-        
-        # ===== STEP 1: Calculate BASELINE bias metrics =====
-        print(f"\n[STEP 1] Calculating BASELINE bias metrics...")
+        # Baseline bias
         bias_detector = BiasDetector()
         baseline_bias = bias_detector.run_all_metrics(y_true, y_pred_original, sensitive_attr)
         baseline_bias = _clean_nan_values(baseline_bias)
-        
         baseline_biased_count = baseline_bias['summary']['biased_metrics_count']
         baseline_biased_metrics = baseline_bias['summary']['biased_metrics']
-        
-        print(f"  Biased metrics count: {baseline_biased_count}")
-        print(f"  Biased metrics: {baseline_biased_metrics}")
-        
-        # ===== STEP 2: Apply mitigation strategy =====
-        print(f"\n[STEP 2] Applying mitigation strategy...")
-        X_train_encoded = _encode_dataframe(X_train)
-        # Get model reference
-        model = None
-        if global_session.model_file_path:
-            try:
-                model = FileManager.load_model(global_session.model_file_path)
-                print(f"  ✅ Model loaded: {type(model).__name__}")
-            except Exception as e:
-                print(f"  ❌ Failed to load model: {str(e)}")
-                raise HTTPException(status_code=400, detail=f"Failed to load model: {str(e)}")
-        
-        if model is None:
-            raise HTTPException(status_code=400, detail="Model required for mitigation strategies")
 
         # Apply mitigation
         mitigator = MitigationStrategies(user_model=model)
@@ -163,171 +145,85 @@ async def apply_mitigation_strategy(request: MitigationRequest):
             y_pred_test=y_pred_original
         )
         
-        # ===== CRITICAL: Handle transformed data for pre-processing =====
-        X_mitigated = X_train_encoded.copy()
-        y_pred_mitigated = y_pred_original.copy()
-
-        # Check what mitigator returned and use it
-        if mitigator.X_transformed is not None:
-            print(f"[USING] Transformed X from mitigator")
-            X_mitigated = mitigator.X_transformed
-            # CRITICAL FIX: Handle feature count mismatch
-            # AIF360 may return extra columns, extract only original features
-            num_original_features = X_train_encoded.shape[1]
-            
-            print(f"  Original features expected: {num_original_features}")
-            print(f"  Transformed X shape: {X_mitigated.shape}")
-            
-            # If transformed has more features than original, take only first n
-            if X_mitigated.shape[1] > num_original_features:
-                print(f"  Feature mismatch detected! Extracting first {num_original_features} features...")
-                X_mitigated = X_mitigated[:, :num_original_features]
-                print(f"  ✅ Adjusted to {X_mitigated.shape[1]} features")
-            
-            # Verify feature count now matches
-            if X_mitigated.shape[1] != num_original_features:
-                print(f"  ⚠️ WARNING: Feature count still doesn't match!")
-                print(f"  Using original X instead of transformed")
-                X_mitigated = X_train_encoded
-            
-            print(f"  Predicting on transformed X...")
-            try:
-                y_pred_mitigated = model.predict(X_mitigated)
-                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
-                print(f"  ✅ Got predictions from transformed X")
-            except Exception as e:
-                print(f"  [ERROR] Could not predict on transformed X: {str(e)}")
-                print(f"  Falling back to original X")
-                X_mitigated = X_train_encoded
-                y_pred_mitigated = model.predict(X_mitigated)
-                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
-
-        elif mitigator.sample_weights is not None:
-            # ADD THIS SECTION - Handle Reweighing
-            print(f"[USING] Reweighted samples from mitigator")
-            print(f"  Weights: min={mitigator.sample_weights.min():.3f}, max={mitigator.sample_weights.max():.3f}, mean={mitigator.sample_weights.mean():.3f}")
-            
-            try:
-                # Clone model and retrain with weights
-                import copy
-                model_reweighted = copy.deepcopy(model)
-                
-                print(f"  Retraining model with weights...")
-                
-                # Check if model supports sample_weight
-                if hasattr(model_reweighted, 'fit'):
-                    # Try to fit with sample_weight
-                    try:
-                        model_reweighted.fit(X_train_encoded, y_true, sample_weight=mitigator.sample_weights)
-                        print(f"  ✅ Retrained with sample weights")
-                    except TypeError:
-                        print(f"  [WARNING] Model doesn't support sample_weight in fit. Using as-is.")
-                
-                # Get predictions from reweighted model
-                y_pred_mitigated = model_reweighted.predict(X_train_encoded)
-                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
-                print(f"  Generated predictions from reweighted model")
-                
-            except Exception as e:
-                print(f"  [ERROR] Reweighting failed: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                y_pred_mitigated = y_pred_original
-            
-        elif mitigator.model_modified:
-            print(f"[USING] Modified model from mitigator")
-
-            # CRITICAL: Check if mitigator has a fine-tuned model stored
-            if hasattr(mitigator, 'fine_tuned_model') and mitigator.fine_tuned_model is not None:
-                print(f"  Using stored fine-tuned model")
-                model_to_use = mitigator.fine_tuned_model
-            else:
-                print(f"  Using mitigator.user_model")
-                model_to_use = mitigator.user_model
-                
-            # Get predictions from fine-tuned model
-            y_pred_mitigated = model_to_use.predict(X_train_encoded)
-            y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
-
-            print(f"  ✅ Generated {len(y_pred_mitigated)} predictions from fine-tuned model")
-            
-        elif mitigator.y_pred_adjusted is not None:
-            print(f"[USING] Adjusted predictions from mitigator")
-            y_pred_mitigated = mitigator.y_pred_adjusted
-            y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
-
-        # Validate strategy result
+        # Ensure strategy returned something meaningful
         if strategy_result.get('status') not in ['success', 'partial']:
+            logger.error(f"Strategy {request.strategy} failed: {strategy_result.get('error')}")
             raise HTTPException(status_code=400, detail=f"Strategy failed: {strategy_result.get('error')}")
 
-        # ===== STEP 3: Calculate MITIGATED bias metrics =====
-        print(f"\n[STEP 3] Calculating MITIGATED bias metrics...")
+        # Determine mitigated predictions and/or transformed data
+        y_pred_mitigated = None
+        X_mitigated = X_train_encoded.copy()
 
-        # For data augmentation, use augmented y_true and sensitive_attr
+        if getattr(mitigator, 'X_transformed', None) is not None:
+            X_mitigated = mitigator.X_transformed
+            # If transformed has more features than expected, truncate (best-effort)
+            expected_cols = X_train_encoded.shape[1]
+            if hasattr(X_mitigated, 'shape') and X_mitigated.shape[1] > expected_cols:
+                X_mitigated = X_mitigated[:, :expected_cols]
+            try:
+                y_pred_mitigated = mitigator.user_model.predict(X_mitigated)
+                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+            except Exception as e:
+                logger.warning(f"Predict on transformed X failed, falling back to original X: {e}")
+                y_pred_mitigated = mitigator.user_model.predict(X_train_encoded)
+                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+
+        elif getattr(mitigator, 'sample_weights', None) is not None:
+            # Re-train (or attempt) with sample weights if supported
+            try:
+                import copy
+                model_reweighted = copy.deepcopy(mitigator.user_model)
+                if hasattr(model_reweighted, 'fit'):
+                    try:
+                        model_reweighted.fit(X_train_encoded, y_true, sample_weight=mitigator.sample_weights)
+                        logger.info("Retrained model with sample weights")
+                    except TypeError:
+                        logger.info("Model.fit doesn't accept sample_weight; skipping retrain")
+                y_pred_mitigated = model_reweighted.predict(X_train_encoded)
+                y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+            except Exception as e:
+                logger.exception("Reweighting failed, using original predictions")
+                y_pred_mitigated = y_pred_original
+
+        elif getattr(mitigator, 'y_pred_adjusted', None) is not None:
+            y_pred_mitigated = _safe_convert_to_numeric(mitigator.y_pred_adjusted, "mitigated_prediction")
+
+        elif getattr(mitigator, 'model_modified', False):
+            model_to_use = getattr(mitigator, 'fine_tuned_model', mitigator.user_model)
+            y_pred_mitigated = _safe_convert_to_numeric(model_to_use.predict(X_train_encoded), "mitigated_prediction")
+
+        # Final validation: ensure lengths match
+        if y_pred_mitigated is None:
+            raise HTTPException(status_code=500, detail="Mitigated predictions could not be obtained")
+
+        # If lengths differ and mitigator provided augmented targets, reconcile them
         y_true_for_metrics = y_true.copy()
-        sensitive_attr_for_metrics = sensitive_attr.copy()
-
-        if hasattr(mitigator, 'y_augmented') and mitigator.y_augmented is not None:
-            print(f"  Using AUGMENTED targets for metrics (size changed from {len(y_true)} to {len(mitigator.y_augmented)})")
+        sensitive_for_metrics = sensitive_attr.copy()
+        if getattr(mitigator, 'y_augmented', None) is not None:
             y_true_for_metrics = np.array(mitigator.y_augmented)
-            sensitive_attr_for_metrics = np.array(mitigator.sensitive_augmented)
+            sensitive_for_metrics = np.array(mitigator.sensitive_augmented)
 
-        print(f"  Data shapes: y_true={len(y_true_for_metrics)}, y_pred={len(y_pred_mitigated)}, sensitive={len(sensitive_attr_for_metrics)}")
-
-        # Validate sizes match BEFORE calling bias_detector
-        print(f"\n[VALIDATION] Checking size alignment:")
-        print(f"  y_true: {len(y_true_for_metrics)}")
-        print(f"  y_pred_mitigated: {len(y_pred_mitigated)}")
-        print(f"  sensitive_attr: {len(sensitive_attr_for_metrics)}")
-            
-        # Validate sizes match
         if len(y_pred_mitigated) != len(y_true_for_metrics):
-            print(f"  ⚠️ Size mismatch: predictions={len(y_pred_mitigated)}, targets={len(y_true_for_metrics)}")
-            # Take only first len(y_true_for_metrics) predictions if needed
+            logger.warning(f"Size mismatch: pred={len(y_pred_mitigated)} target={len(y_true_for_metrics)} - applying truncation if safe")
             if len(y_pred_mitigated) > len(y_true_for_metrics):
-                print(f"  Truncating predictions to match target size...")
                 y_pred_mitigated = y_pred_mitigated[:len(y_true_for_metrics)]
-            elif len(y_pred_mitigated) < len(y_true_for_metrics):
-                print(f"  ⚠️ ERROR: Not enough predictions!")
-                raise ValueError(f"Predictions ({len(y_pred_mitigated)}) < targets ({len(y_true_for_metrics)})")
-            
-        if len(sensitive_attr_for_metrics) != len(y_true_for_metrics):
-            print(f"  ⚠️ ERROR: Sensitive attr size mismatch!")
-            raise ValueError(f"Sensitive attr ({len(sensitive_attr_for_metrics)}) != targets ({len(y_true_for_metrics)})")
+            else:
+                raise HTTPException(status_code=400, detail="Mitigated predictions fewer than targets after mitigation")
 
-        print(f"  ✅ All shapes validated - proceeding with metrics")
-        print(f"\n[CALLING] bias_detector.run_all_metrics with:")
-        print(f"  y_true: {type(y_true_for_metrics).__name__} shape {y_true_for_metrics.shape}")
-        print(f"  y_pred_mitigated: {type(y_pred_mitigated).__name__} shape {y_pred_mitigated.shape}")
-        print(f"  sensitive_attr: {type(sensitive_attr_for_metrics).__name__} shape {sensitive_attr_for_metrics.shape}")
-
-        mitigated_bias = bias_detector.run_all_metrics(y_true_for_metrics, y_pred_mitigated, sensitive_attr_for_metrics)
-        mitigated_bias = _clean_nan_values(mitigated_bias)
-        
+        mitigated_bias = bias_detector.run_all_metrics(y_true_for_metrics, y_pred_mitigated, sensitive_for_metrics)
+        mitigated_bias = _clean_nan_values(mitigated_bias) 
         mitigated_biased_count = mitigated_bias['summary']['biased_metrics_count']
         mitigated_biased_metrics = mitigated_bias['summary']['biased_metrics']
         
-        print(f"  Biased metrics count: {mitigated_biased_count}")
-        print(f"  Biased metrics: {mitigated_biased_metrics}")
-        
         # ===== STEP 4: Calculate improvements =====
-        print(f"\n[STEP 4] Calculating improvements...")
-        improvement = baseline_biased_count - mitigated_biased_count
-        
+        improvement = baseline_biased_count - mitigated_biased_count 
         metric_improvements = _calculate_metric_improvements(baseline_bias, mitigated_bias)
-        
-        print(f"  Overall improvement: {improvement} fewer biased metrics")
-        print(f"  Status: {'✅ IMPROVED' if improvement > 0 else ('❌ WORSENED' if improvement < 0 else '➡️ NO CHANGE')}")
-        
-        # Clean strategy result for JSON
-        strategy_result_clean = _serialize_mitigation_result(strategy_result)
         
         # Build response
         response = {
             'status': 'success',
             'strategy_applied': request.strategy,
-            'strategy_info': strategy_result_clean,
-            
+            'strategy_info': _serialize_mitigation_result(strategy_result),
             'bias_assessment': {
                 'baseline': {
                     'summary': baseline_bias['summary'],
@@ -359,16 +255,12 @@ async def apply_mitigation_strategy(request: MitigationRequest):
             )
         }
         
-        print(f"\n{'='*60}\n")
-        
         return response
     
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] Error applying mitigation: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.exception("Error applying mitigation")
         raise HTTPException(status_code=500, detail=f"Error applying mitigation: {str(e)}")
 
 @router.post("/compare")
@@ -377,52 +269,18 @@ async def compare_strategies(request: StrategyComparisonRequest):
     Compare bias scores before and after applying different strategies
     """
     try:
-        if global_session.train_file_path is None:
-            raise HTTPException(status_code=400, detail="Training data must be uploaded first")
-        
-        if global_session.target_column is None:
-            raise HTTPException(status_code=400, detail="Target column must be set first")
-        
-        # Load data
-        train_df = FileManager.load_csv(global_session.train_file_path)
-        
-        # Prepare data
-        y_true = _safe_convert_to_numeric(
-            train_df[global_session.target_column].values,
-            "y_true"
+        # Load & prepare using shared helper
+        train_df, X_train, X_train_encoded, y_true, sensitive_attr, model, y_pred = _load_and_prepare(
+            prediction_column=request.prediction_column,
+            sensitive_feature_column=request.sensitive_feature_column
         )
-        
-        sensitive_feature = _safe_convert_to_numeric(
-            train_df[request.sensitive_feature_column].values,
-            request.sensitive_feature_column
-        )
-        
-        # Get predictions
-        if request.prediction_column and request.prediction_column.strip():
-            # Use prediction column from data
-            print(f"[INFO] Using prediction_column: {request.prediction_column}")
-            if request.prediction_column not in train_df.columns:
-                raise HTTPException(status_code=400, detail=f"Prediction column '{request.prediction_column}' not found")
-            y_pred = _safe_convert_to_numeric(
-                train_df[request.prediction_column].values,
-                request.prediction_column
-            )
-        
-        elif global_session.model_file_path:
-            # Use uploaded model for predictions
-            print(f"[INFO] Using model predictions from uploaded model")
-            model = FileManager.load_model(global_session.model_file_path)
-            X_test = train_df.drop(columns=[global_session.target_column]).copy()
-            X_test_encoded = _encode_dataframe(X_test)
-            y_pred = model.predict(X_test_encoded)
-            y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
 
-        else:
-            raise HTTPException(status_code=400, detail="Prediction column required for comparison")
+        if model is None:
+            raise HTTPException(status_code=400, detail="Model required for strategy comparison")
         
         # Get baseline bias metrics
         bias_detector = BiasDetector()
-        baseline_results = bias_detector.run_all_metrics(y_true, y_pred, sensitive_feature)
+        baseline_results = bias_detector.run_all_metrics(y_true, y_pred, sensitive_attr)
         baseline_results = _clean_nan_values(baseline_results)
 
         baseline_biased_count = baseline_results['summary']['biased_metrics_count']
@@ -460,7 +318,7 @@ async def compare_strategies(request: StrategyComparisonRequest):
                     strategy_name,
                     X_train_encoded,
                     y_true,
-                    sensitive_feature,
+                    sensitive_attr,
                     X_test=X_train_encoded,
                     y_test=y_true,
                     y_pred_test=y_pred
@@ -468,13 +326,43 @@ async def compare_strategies(request: StrategyComparisonRequest):
                 
                 # For now, assume predictions remain same (in real scenario, would re-predict)
                 # In production, you'd retrain the model with mitigated data
-                y_pred_mitigated = y_pred
+                if mitigator.X_transformed is not None:
+                    X_tmp = mitigator.X_transformed
+                    expected_cols = X_train_encoded.shape[1]
+                    if X_tmp.shape[1] > expected_cols:
+                        X_tmp = X_tmp[:, :expected_cols]
+                    try:
+                        y_pred_mitigated = model.predict(X_tmp)
+                        y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+                    except:
+                        y_pred_mitigated = y_pred
+
+                elif mitigator.y_pred_adjusted is not None:
+                    y_pred_mitigated = _safe_convert_to_numeric(mitigator.y_pred_adjusted, "mitigated_prediction")
+
+                elif mitigator.sample_weights is not None:
+                    # simple reweighted retrain
+                    try:
+                        import copy
+                        model_copy = copy.deepcopy(model)
+                        model_copy.fit(X_train_encoded, y_true, sample_weight=mitigator.sample_weights)
+                        y_pred_mitigated = model_copy.predict(X_train_encoded)
+                        y_pred_mitigated = _safe_convert_to_numeric(y_pred_mitigated, "mitigated_prediction")
+                    except:
+                        y_pred_mitigated = y_pred
+
+                elif mitigator.model_modified:
+                    mdl = getattr(mitigator, "fine_tuned_model", model)
+                    y_pred_mitigated = _safe_convert_to_numeric(mdl.predict(X_train_encoded), "mitigated_prediction")
+
+                else:
+                    y_pred_mitigated = y_pred
                 
                 # Calculate bias metrics after mitigation
                 if strategy_result.get('status') == 'success':
                     print(f"  ✅ Strategy applied successfully")
                     mitigated_results = bias_detector.run_all_metrics(
-                        y_true, y_pred_mitigated, sensitive_feature
+                        y_true, y_pred_mitigated, sensitive_attr
                     )
                     mitigated_results = _clean_nan_values(mitigated_results)
                     
@@ -565,21 +453,21 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
         
         print(f"Request parameters:")
 
-        # Check which attributes exist
-        if hasattr(request, 'strategies'):
-            strategies = request.strategies
-            print(f"  Strategies: {strategies}")
-        elif hasattr(request, 'pipeline'):
-            strategies = []  # Convert single to list
-            for stage in ['pre', 'in', 'post']:
-                if stage in request.pipeline:
-                    strategies.extend(request.pipeline[stage])
-            print(f"  Strategies from pipeline: {strategies}")
-        else:
+        # Extract strategy list from multi-stage pipeline
+        strategies = []
+        pipeline_dict = request.pipeline or {}
+
+        for stage in ["pre", "in", "post"]:
+            if stage in pipeline_dict and isinstance(pipeline_dict[stage], list):
+                strategies.extend(pipeline_dict[stage])
+
+        if not strategies:
             raise HTTPException(
                 status_code=400,
-                detail="Request must contain 'strategies' or 'strategy' field"
+                detail="Pipeline is empty. Add strategies under pre/in/post stages."
             )
+
+        print(f"  Final strategy execution order: {strategies}")
 
         if hasattr(request, 'sensitive_feature_column'):
             sensitive_feature = request.sensitive_feature_column
@@ -594,64 +482,11 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
         print(f"  Sensitive feature: {sensitive_feature}")
         print(f"  Prediction column: {prediction_column}")
 
-        if global_session.train_file_path is None:
-            raise HTTPException(status_code=400, detail="Training data must be uploaded first")
-        
-        if global_session.target_column is None:
-            raise HTTPException(status_code=400, detail="Target column must be set first")
-        
-        # Load data
-        train_df = FileManager.load_csv(global_session.train_file_path)
-        
-        # Prepare data
-        X_train = train_df.drop(columns=[global_session.target_column]).copy()
-        y_true = _safe_convert_to_numeric(
-            train_df[global_session.target_column].values,
-            "y_true"
+        # Use shared loader for data inputs
+        _, X_train, X_train_encoded, y_true, sensitive_attr, model, y_pred = _load_and_prepare(
+            prediction_column=request.prediction_column,
+            sensitive_feature_column=request.sensitive_feature_column
         )
-
-        # Validate sensitive_feature_column exists
-        if request.sensitive_feature_column not in train_df.columns:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Sensitive feature column '{request.sensitive_feature_column}' not found in data. Available columns: {list(train_df.columns)}"
-            )
-
-        print(f"\n[INFO] Sensitive feature column: {request.sensitive_feature_column}")
-        print(f"  Available columns: {list(train_df.columns)}")
-        
-        sensitive_attr = _safe_convert_to_numeric(
-            train_df[request.sensitive_feature_column].values,
-            request.sensitive_feature_column
-        )
-
-        print(f"\n[SENSITIVE FEATURE ANALYSIS]")
-        print(f"  Column: {request.sensitive_feature_column}")
-        print(f"  Unique values: {np.unique(sensitive_attr)}")
-        print(f"  Number of groups: {len(np.unique(sensitive_attr))}")
-        for group in np.unique(sensitive_attr):
-            count = np.sum(sensitive_attr == group)
-            pct = (count / len(sensitive_attr)) * 100
-            print(f"  Group {group}: {count} samples ({pct:.1f}%)")
-        
-        # Get predictions
-        if request.prediction_column and request.prediction_column.strip():
-            print(f"[INFO] Using prediction_column: {request.prediction_column}")
-            if request.prediction_column not in train_df.columns:
-                raise HTTPException(status_code=400, detail=f"Prediction column '{request.prediction_column}' not found")
-            y_pred = _safe_convert_to_numeric(
-                train_df[request.prediction_column].values,
-                request.prediction_column
-            )
-        elif global_session.model_file_path:
-            print(f"[INFO] Using model predictions from uploaded model")
-            model = FileManager.load_model(global_session.model_file_path)
-            X_test = train_df.drop(columns=[global_session.target_column]).copy()
-            X_test_encoded = _encode_dataframe(X_test)
-            y_pred = model.predict(X_test_encoded)
-            y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
-        else:
-            raise HTTPException(status_code=400, detail="Either prediction_column or uploaded model required")
         
         # Calculate BASELINE bias metrics
         print(f"\n[BASELINE] Calculating original bias metrics...")
@@ -683,20 +518,12 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
         # Get pipeline summary
         pipeline_summary = pipeline.get_pipeline_summary()
 
-        # Get model for strategies
-        model = None
-        if global_session.model_file_path:
-            model = FileManager.load_model(global_session.model_file_path)
-
         if model is None:
             raise HTTPException(status_code=400, detail="Model required for mitigation strategies")
 
         print(f"\n[PIPELINE SETUP]")
         print(f"  Strategies to apply: {strategies}")
         print(f"  Model type: {type(model).__name__}")
-        
-        # Encode data
-        X_train_encoded = _encode_dataframe(X_train)
 
         # Generate mitigated predictions (simplified for demo)
         y_pred_current = y_pred.copy()
@@ -721,6 +548,7 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
             print(f"\n{'='*60}")
             print(f"[STAGE {idx}/{len(strategies)}] {strategy.upper()}")
             print(f"{'='*60}")
+            X_current = X_train_encoded
             
             try:
                 # Verify model exists
@@ -740,7 +568,7 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
 
                 strategy_result = mitigator.run_mitigation_strategy(
                     strategy,
-                    X_train_encoded,
+                    X_current,
                     y_true_current,  # Use current (possibly augmented) y_true
                     sensitive_attr_current,  # Use current (possibly augmented) sensitive_attr
                     X_test=X_train_encoded,
@@ -767,24 +595,16 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
                     sensitive_attr_current = np.array(mitigator.sensitive_augmented)
                     
                     # Use augmented X for predictions
-                    if hasattr(mitigator, 'X_augmented') and mitigator.X_augmented is not None:
-                        print(f"  Using augmented X data for predictions")
-                        X_augmented_encoded = _encode_dataframe(pd.DataFrame(mitigator.X_augmented))
-                        y_pred_current = model.predict(X_augmented_encoded)
+                    if hasattr(mitigator, "X_augmented") and mitigator.X_augmented is not None:
+                        X_current = _encode_dataframe(pd.DataFrame(mitigator.X_augmented))
                     else:
-                        # Fallback if X_augmented not available
-                        y_pred_current = model.predict(X_train_encoded)
-
-                    y_pred_current = _safe_convert_to_numeric(y_pred_current, "predictions")
-                    
-                    print(f"  Now using augmented data: {len(y_pred_current)} predictions")
+                        X_current = X_current
 
                 elif mitigator.y_pred_adjusted is not None:
                     print(f"  Using adjusted predictions")
                     y_pred_current = mitigator.y_pred_adjusted
                 
                 elif mitigator.X_transformed is not None:
-                    print(f"  Using transformed data for predictions")
                     X_train_encoded_temp = mitigator.X_transformed
                     
                     # Handle feature mismatch
@@ -792,6 +612,7 @@ async def apply_mitigation_pipeline(request: PipelineRequest):
                     if X_train_encoded_temp.shape[1] > num_original_features:
                         X_train_encoded_temp = X_train_encoded_temp[:, :num_original_features]
                     
+                    X_current = X_train_encoded_temp
                     y_pred_current = model.predict(X_train_encoded_temp)
                     y_pred_current = _safe_convert_to_numeric(y_pred_current, "predictions")
                 
@@ -967,7 +788,7 @@ async def compare_mitigation_pipelines(request: PipelineComparisonRequest):
         elif global_session.model_file_path:
             model = FileManager.load_model(global_session.model_file_path)
             X_test = train_df.drop(columns=[global_session.target_column]).copy()
-            X_test_encoded = _encode_dataframe(X_test)
+            X_test_encoded, _ = _encode_dataframe(X_test)
             y_pred = model.predict(X_test_encoded)
             y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
         else:
@@ -986,7 +807,9 @@ async def compare_mitigation_pipelines(request: PipelineComparisonRequest):
         
         # Prepare data
         X_train = train_df.drop(columns=[global_session.target_column]).copy()
-        X_train_encoded = _encode_dataframe(X_train)
+        X_train_encoded, encoders = _encode_dataframe(X_train)
+
+        global_session.encoders = encoders
         
         # Compare each pipeline
         pipeline_comparisons = {
@@ -1220,8 +1043,57 @@ async def optimize_pipeline(request: OptimizationRequest):
         elif model is not None:
             print(f"  Using model predictions")
             X_test = train_df.drop(columns=[global_session.target_column]).copy()
-            X_test_encoded = _encode_dataframe(X_test)
-            y_pred = model.predict(X_test_encoded)
+            X_test_encoded, test_encoders = _encode_dataframe(X_test)
+
+            # Store encoders in session
+            if not hasattr(global_session, 'encoders'):
+                global_session.encoders = test_encoders
+            try:
+                # Ensure it's a proper 2D numpy array
+                if isinstance(X_test_encoded, pd.DataFrame):
+                    X_test_encoded = X_test_encoded.values
+                
+                # Force to float type and check shape
+                X_test_encoded = np.array(X_test_encoded, dtype=np.float64)
+                
+                # Verify shape consistency
+                if X_test_encoded.ndim != 2:
+                    raise ValueError(f"X_test_encoded must be 2D, got shape {X_test_encoded.shape}")
+                
+                # Check for nested arrays or objects
+                if X_test_encoded.dtype == 'object':
+                    logger.error("X_test_encoded contains object dtype - attempting to flatten")
+                    # Try to flatten nested structures
+                    X_flat = []
+                    for row in X_test_encoded:
+                        if isinstance(row, (list, np.ndarray)):
+                            X_flat.append(np.array(row, dtype=float).flatten())
+                        else:
+                            X_flat.append([float(row)])
+                    X_test_encoded = np.array(X_flat, dtype=np.float64)
+                
+                logger.info(f"X_test_encoded shape: {X_test_encoded.shape}, dtype: {X_test_encoded.dtype}")
+
+                # FIX: Validate feature count
+                if hasattr(model, 'n_features_in_'):
+                    expected_features = model.n_features_in_
+                    actual_features = X_test_encoded.shape[1]
+                    if expected_features != actual_features:
+                        raise ValueError(
+                            f"Feature mismatch: Model expects {expected_features} features, "
+                            f"but got {actual_features}"
+                        )
+                
+                y_pred = model.predict(X_test_encoded)
+                
+            except ValueError as ve:
+                logger.error(f"Shape validation error: {ve}")
+                logger.error(f"X_test_encoded shape: {X_test_encoded.shape if hasattr(X_test_encoded, 'shape') else 'no shape'}")
+                logger.error(f"X_test_encoded dtype: {X_test_encoded.dtype if hasattr(X_test_encoded, 'dtype') else 'no dtype'}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Data shape error: {str(ve)}. Ensure all features are numeric and have consistent dimensions."
+                )
             y_pred = _safe_convert_to_numeric(y_pred, "model_prediction")
         else:
             raise HTTPException(status_code=400, detail="Either prediction_column or uploaded model required")
@@ -1240,7 +1112,7 @@ async def optimize_pipeline(request: OptimizationRequest):
         baseline_biased_count = baseline_bias['summary']['biased_metrics_count']
         
         # Encode data
-        X_train_encoded = _encode_dataframe(X_train)
+        X_train_encoded, _ = _encode_dataframe(X_train, saved_encoders=global_session.encoders)
         
         # Run optimization
         from app.pipeline_optimizer import PipelineOptimizer
@@ -1253,7 +1125,6 @@ async def optimize_pipeline(request: OptimizationRequest):
                 sensitive_attr,
                 y_pred,
                 baseline_biased_count
-                # max_strategies=request.max_strategies or 3
             )
         
         elif request.method == 'top_k':

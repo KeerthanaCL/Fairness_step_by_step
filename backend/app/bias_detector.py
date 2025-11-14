@@ -49,7 +49,7 @@ class BiasDetector:
         try:
             # demographic_parity_difference needs sensitive_features as keyword argument
             dp_diff = demographic_parity_difference(
-                y_true=y_pred,
+                y_true=y_true,
                 y_pred=y_pred,
                 sensitive_features=sensitive_feature
             )

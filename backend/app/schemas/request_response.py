@@ -4,9 +4,13 @@ from typing import List, Optional, Dict, Any
 class UploadResponse(BaseModel):
     status: str
     message: str
-    train_shape: Optional[tuple] = None
-    test_shape: Optional[tuple] = None
+    train_shape: Optional[List[int]] = None
+    test_shape: Optional[List[int]] = None
     columns: Optional[List[str]] = None
+
+    class Config:
+        str_strip_whitespace = True
+        validate_assignment = True
 
 class TargetColumnRequest(BaseModel):
     target_column: str = Field(..., description="Name of the target column")
@@ -17,13 +21,13 @@ class ConfigurationResponse(BaseModel):
     configured: bool
 
 class AnalysisRequest(BaseModel):
-    n_top_features: int = Field(10, description="Number of top features to select")
+    n_top_features: int = Field(10, ge=1, le=100,description="Number of top features to select")
 
 class FeatureSensitivityScore(BaseModel):
     feature: str
-    nocco_score: float
+    nocco_score: float = Field(..., ge=0.0)
     is_sensitive: bool
-    percentile_rank: float
+    percentile_rank: float = Field(..., ge=0.0, le=100.0)
     test_type: str = "unknown"
 
 class AnalysisResponse(BaseModel):
@@ -73,24 +77,29 @@ class BiasAnalysisResponse(BaseModel):
     recommendations: List[str]
 
 class PipelineRequest(BaseModel):
-    """Request for mitigation pipeline - apply multiple strategies in sequence"""
+    """
+    Request for a multi-stage mitigation pipeline.
+    The pipeline is structured in three stages:
+      - pre:  data preprocessing strategies
+      - in:   in-processing (model training) strategies
+      - post: post-processing (prediction adjustments)
+    """
     
     strategies: List[str] = Field(
         ...,
+        min_length=1,
         description="List of mitigation strategies to apply in order",
         example=["disparate_impact_remover", "data_augmentation"]
     )
     
     sensitive_feature_column: str = Field(
         ...,
-        description="Column name of the sensitive attribute to mitigate for (e.g., 'experience', 'gender', 'race')",
-        example="experience"
+        description="Name of the sensitive feature column"
     )
     
     prediction_column: Optional[str] = Field(
         None,
-        description="Column name containing predictions (optional - if not provided, model will be used)",
-        example=""
+        description="Column name containing predictions (optional - if not provided, model will be used)"
     )
 
 

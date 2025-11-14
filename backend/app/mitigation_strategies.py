@@ -1215,6 +1215,20 @@ class MitigationPipeline:
                     y_test=y_test,
                     y_pred_test=y_pred_current
                 )
+
+                if self.mitigator.y_augmented is not None:
+                    X_current = pd.DataFrame(self.mitigator.X_augmented)
+                    y_current = np.array(self.mitigator.y_augmented)
+                    sensitive_current = np.array(self.mitigator.sensitive_augmented)
+
+                elif self.mitigator.X_transformed is not None:
+                    X_current = self.mitigator.X_transformed
+
+                elif self.mitigator.y_pred_adjusted is not None:
+                    y_pred_current = self.mitigator.y_pred_adjusted
+
+                elif self.mitigator.fine_tuned_model is not None:
+                    y_pred_current = self.mitigator.fine_tuned_model.predict(X_current)
                 
                 pre_results.append({
                     'strategy': strategy,
@@ -1246,6 +1260,20 @@ class MitigationPipeline:
                     y_test=y_test,
                     y_pred_test=y_pred_current
                 )
+
+                if self.mitigator.y_augmented is not None:
+                    X_current = pd.DataFrame(self.mitigator.X_augmented)
+                    y_current = np.array(self.mitigator.y_augmented)
+                    sensitive_current = np.array(self.mitigator.sensitive_augmented)
+
+                elif self.mitigator.X_transformed is not None:
+                    X_current = self.mitigator.X_transformed
+
+                elif self.mitigator.y_pred_adjusted is not None:
+                    y_pred_current = self.mitigator.y_pred_adjusted
+
+                elif self.mitigator.fine_tuned_model is not None:
+                    y_pred_current = self.mitigator.fine_tuned_model.predict(X_current)
                 
                 in_results.append({
                     'strategy': strategy,
@@ -1277,6 +1305,20 @@ class MitigationPipeline:
                     y_test=y_test,
                     y_pred_test=y_pred_current
                 )
+
+                if self.mitigator.y_augmented is not None:
+                    X_current = pd.DataFrame(self.mitigator.X_augmented)
+                    y_current = np.array(self.mitigator.y_augmented)
+                    sensitive_current = np.array(self.mitigator.sensitive_augmented)
+
+                elif self.mitigator.X_transformed is not None:
+                    X_current = self.mitigator.X_transformed
+
+                elif self.mitigator.y_pred_adjusted is not None:
+                    y_pred_current = self.mitigator.y_pred_adjusted
+
+                elif self.mitigator.fine_tuned_model is not None:
+                    y_pred_current = self.mitigator.fine_tuned_model.predict(X_current)
                 
                 post_results.append({
                     'strategy': strategy,
