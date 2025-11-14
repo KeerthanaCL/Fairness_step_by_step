@@ -3,6 +3,8 @@ from app.utils import FileManager
 from app.hsic_detector import AnalysisEngine
 from app.models import global_session
 from app.schemas.request_response import AnalysisResponse, FeatureSensitivityScore
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/analysis", tags=["Analysis"])
 
@@ -32,6 +34,7 @@ async def run_fairness_analysis(n_top_features: int = 10):
         
         # Run analysis
         results = engine.run_analysis(n_top_features=n_top_features)
+        results["detector_obj"] = engine.detector
         
         # Store results in session
         global_session.analysis_results = results
@@ -46,6 +49,8 @@ async def run_fairness_analysis(n_top_features: int = 10):
             )
             for score in results["feature_sensitivity_scores"]
         ]
+
+        logger.info("Analysis finished; stored detector instance in session")
         
         return AnalysisResponse(
             status="success",
@@ -75,9 +80,16 @@ async def get_analysis_results():
                 detail="No analysis results found. Run analysis first."
             )
         
+        # Create a copy and exclude non-serializable objects
+        results_copy = {
+            key: value 
+            for key, value in global_session.analysis_results.items() 
+            if key != "detector_obj"
+        }
+        
         return {
             "status": "success",
-            "results": global_session.analysis_results
+            "results": results_copy
         }
     
     except HTTPException:
@@ -89,7 +101,8 @@ async def get_analysis_results():
 @router.get("/feature-relationships/{feature_index}")
 async def get_feature_relationships(feature_index: int, num_neighbors: int = 5):
     """
-    Get features that are related to a specific feature
+    Get features that are related to a specific feature using the already-fitted detector.
+    This avoids re-running the HSIC analysis (which is expensive and may give different results).
     
     Args:
         feature_index: Index of the feature (0-based)
@@ -102,23 +115,28 @@ async def get_feature_relationships(feature_index: int, num_neighbors: int = 5):
                 detail="No analysis results found. Run analysis first."
             )
         
-        # Get relationships from detector
-        from app.hsic_detector import AnalysisEngine
-        engine = AnalysisEngine()
-        train_df = FileManager.load_csv(global_session.train_file_path)
-        engine.train_df = train_df
-        engine.target_column = global_session.target_column
-        
-        # Rerun to get detector instance
-        results = engine.run_analysis()
-        relationships = engine.detector.get_feature_relationships(feature_index, num_neighbors)
-        
+        # Retrieve detector instance stored during initial analysis
+        detector = global_session.analysis_results.get("detector_obj", None)
+        if detector is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Detector instance not found in session. Re-run analysis to rebuild detector."
+            )
+
+        # Validate feature index range
+        total_features = global_session.analysis_results.get("analysis_summary", {}).get("total_features", None)
+        if total_features is not None and (feature_index < 0 or feature_index >= total_features):
+            raise HTTPException(status_code=400, detail=f"feature_index {feature_index} out of range (0..{total_features-1})")
+
+        relationships = detector.get_feature_relationships(feature_index, num_neighbors)
+
         return {
             "status": "success",
             "relationships": relationships
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Error retrieving feature relationships")
         raise HTTPException(status_code=500, detail=f"Error retrieving relationships: {str(e)}")

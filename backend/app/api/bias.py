@@ -7,23 +7,11 @@ import pandas as pd
 from app.utils import FileManager
 from app.models import global_session
 from app.bias_detector import BiasDetector
+from app.schemas.request_response import BiasAnalysisRequest, BiasAnalysisResponse
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/bias", tags=["Bias Detection"])
-
-class BiasAnalysisRequest(BaseModel):
-    sensitive_feature_column: str
-    prediction_column: Optional[str] = None  # If using model predictions
-    prediction_proba_column: Optional[str] = None  # Probability scores
-
-class BiasMetricsResponse(BaseModel):
-    status: str
-    analysis_type: str
-    sensitive_feature: str
-    total_metrics: int
-    biased_metrics_count: int
-    overall_bias_status: str
-    metrics_results: Dict
-    recommendations: List[str]
 
 @router.post("/analyze")
 async def analyze_bias(request: BiasAnalysisRequest):
@@ -141,85 +129,95 @@ async def get_bias_thresholds():
 
 def _safe_convert_to_numeric(data: np.ndarray, name: str) -> np.ndarray:
     """
-    Safely convert any data to numeric (int)
-    Handles: int, float, bool, string, categorical
+    Safely convert any data to numeric integers.
+    - Preserves order-based mapping for categorical values (first-seen -> 0..n-1).
+    - Handles booleans, ints, floats, strings and mixed object arrays.
+    - Raises a ValueError if conversion fails.
     """
-    print(f"\n[CONVERT] Converting {name}")
-    print(f"  Input type: {data.dtype}, Sample: {data[:3]}")
+    logger.info(f"[CONVERT] Converting {name}")
     
     try:
-        # If already numeric, just convert to int
-        if data.dtype in [np.int32, np.int64, np.float32, np.float64]:
-            result = data.astype(int)
-            print(f"  Already numeric, converted to int")
-            return result
+        # Already numeric floats/ints -> cast to int safely
+        if np.issubdtype(data.dtype, np.integer) or np.issubdtype(data.dtype, np.floating):
+            return data.astype(int)
+
+        # Boolean -> int
+        if data.dtype == bool or (data.dtype == np.bool_):
+            return data.astype(int)
         
-        # If boolean, convert True->1, False->0
-        if data.dtype == bool:
-            result = data.astype(int)
-            print(f"  Boolean converted to int")
-            return result
-        
-        # If object (string/mixed), try to convert
-        if data.dtype == 'object':
-            print(f"  Detected string/object type")
+        # Object - possibly strings / mixed
+        if data.dtype == object or data.dtype == 'O':
             
-            # Try direct int conversion first
+            # Try direct numeric conversion first
             try:
-                result = data.astype(int)
-                print(f"  Successfully converted to int directly")
-                return result
-            except:
-                pass
-            
-            # Try float then int
-            try:
-                result = data.astype(float).astype(int)
-                print(f"  Converted via float->int")
-                return result
-            except:
-                pass
-            
-            # Categorical encoding: map unique values to integers
-            print(f"  Using categorical encoding")
-            unique_vals = np.unique(data)
-            mapping = {val: idx for idx, val in enumerate(sorted(unique_vals))}
-            result = np.array([mapping[val] for val in data], dtype=int)
-            print(f"  Mapping: {mapping}")
-            return result
-        
-        # Fallback
-        result = data.astype(int)
-        return result
-        
+                numeric = pd.to_numeric(data, errors='raise')
+                return numeric.astype(int).to_numpy()
+            except Exception:
+                # Fall back to stable categorical mapping (preserve first-seen order)
+                mapping = {}
+                mapped = []
+                next_idx = 0
+                for val in data:
+                    key = val if not (isinstance(val, str) and val.strip() == "") else "__MISSING__"
+                    if key not in mapping:
+                        mapping[key] = next_idx
+                        next_idx += 1
+                    mapped.append(mapping[key])
+                logger.debug(f"[CONVERT] {name} categorical mapping: {mapping}")
+                return np.array(mapped, dtype=int)
+
+        # As a last resort, attempt converting element-wise
+        return np.array([int(x) for x in data], dtype=int)
+
     except Exception as e:
-        print(f"[ERROR] Conversion failed: {str(e)}")
+        logger.exception(f"Conversion failed for {name}")
         raise ValueError(f"Could not convert {name} to numeric: {str(e)}")
     
-def _encode_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def _encode_dataframe(df: pd.DataFrame, saved_encoders: Dict[str, Dict] = None) -> pd.DataFrame:
     """
-    Encode categorical columns to numeric
-    Same way as the model was trained
+    Encode categorical columns to numeric in a stable, reproducible way.
+    - If `saved_encoders` provided (dict of col -> mapping), reuse them.
+      Otherwise, create mappings where needed (preserving first-seen order).
+    - Returns df_encoded (numeric) and *does not* alter original df.
     """
     df_encoded = df.copy()
+    encoders = saved_encoders or {}
     
     for col in df_encoded.columns:
-        if df_encoded[col].dtype == 'object':
-            print(f"  Encoding column: {col}")
-            # Convert to numeric: try direct conversion, then categorical
-            try:
-                df_encoded[col] = pd.to_numeric(df_encoded[col], errors='coerce')
-            except:
-                # Categorical encoding
-                unique_vals = df_encoded[col].unique()
-                mapping = {val: idx for idx, val in enumerate(sorted(unique_vals))}
-                df_encoded[col] = df_encoded[col].map(mapping)
-                print(f"    Mapping: {mapping}")
+        # If dtype numeric already, ensure numeric and fill NAs
+        if df_encoded[col].dtype == 'object' or df_encoded[col].dtype.name == 'category':
+            df_encoded[col] = df_encoded[col].astype(str)
+
+            if col in encoders:
+                # Use saved encoder
+                le = encoders[col]
+                # Handle unseen labels
+                df_encoded[col] = df_encoded[col].apply(
+                    lambda x: le.transform([x])[0] if x in le.classes_ else -1
+                )
+            else:
+                # Create new encoder
+                from sklearn.preprocessing import LabelEncoder
+                le = LabelEncoder()
+                df_encoded[col] = le.fit_transform(df_encoded[col])
+                encoders[col] = le
         
-        # Ensure numeric
+        # CRITICAL: Ensure all columns are 1D numeric arrays
         df_encoded[col] = pd.to_numeric(df_encoded[col], errors='coerce').fillna(0)
     
-    return df_encoded
+    # VALIDATE: Check for homogeneous shape
+    try:
+        test_array = df_encoded.values
+        if test_array.dtype == 'object':
+            # Convert object arrays to float
+            df_encoded = df_encoded.astype(float)
+    except Exception as e:
+        logger.error(f"Error converting to numpy array: {e}")
+        # Force conversion column by column
+        for col in df_encoded.columns:
+            df_encoded[col] = pd.to_numeric(df_encoded[col], errors='coerce').fillna(0)
+    
+    return df_encoded, encoders
 
 def _clean_nan_values(obj):
     """Recursively remove NaN values from nested dicts/lists"""

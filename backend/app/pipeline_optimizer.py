@@ -358,6 +358,20 @@ class PipelineOptimizer:
                 y_test=y_train,
                 y_pred_test=y_pred
             )
+
+            if mitigator.y_augmented is not None:
+                X_train_current = mitigator.X_augmented
+                y_train_current = mitigator.y_augmented
+                sensitive_attr_current = mitigator.sensitive_augmented
+
+            elif mitigator.X_transformed is not None:
+                X_train_current = mitigator.X_transformed
+
+            elif mitigator.y_pred_adjusted is not None:
+                y_pred_mitigated = mitigator.y_pred_adjusted
+
+            elif mitigator.fine_tuned_model is not None:
+                y_pred_mitigated = mitigator.fine_tuned_model.predict(X_train_current)
             
             # Extract predictions based on what the strategy produced
             if mitigator.y_pred_adjusted is not None:

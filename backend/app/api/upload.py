@@ -88,7 +88,15 @@ async def upload_model(file: UploadFile = File(...)):
         global_session.model_file_path = file_path
         
         # Validate model can be loaded
-        model = FileManager.load_model(file_path)
+        try:
+            model = FileManager.load_model(file_path)
+        except Exception as e:
+            # Remove saved model file (avoid leaving bad file) and return clear error
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=400, detail=f"Uploaded model could not be loaded: {str(e)}")
         
         return UploadResponse(
             status="success",
